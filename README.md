@@ -45,7 +45,8 @@ Credentials resolve from `--password` → `$ROUTER_PASS` → `~/.config/tpwrctl/
 |---|---|
 | `status` | Model, firmware, WAN, public IP, CPU, online devices — one screen |
 | `devices [--online]` | Every device: name, IP, MAC, wired/Wi-Fi, signal |
-| `wifi` | Associated Wi-Fi clients with signal, link rate, standard |
+| `wifi` | Show AP config (SSID, security, **password**) + clients |
+| `wifi --ssid/--password/--bandwidth/--radio` | **Change Wi-Fi** (confirms first; `--dry-run` to preview) |
 | `wan` | Internet connection details (IP, DNS, NAT, firewall) |
 | `speed [--interval N]` | Live per-client Wi-Fi throughput |
 | `cpu` | CPU usage + approximate uptime |
@@ -53,17 +54,31 @@ Credentials resolve from `--password` → `$ROUTER_PASS` → `~/.config/tpwrctl/
 | `audit` | 🔎 Security audit — port exposure + config findings |
 | `reboot [-y]` | Reboot (asks first; `-y` to skip) |
 | `oids` | 📖 Catalog of web-API objects you can `get`/`set` |
-| `get <OID> [attrs] [--gl] [--json]` | **General read** — any object, friendly or JSON |
-| `set <OID> attr=val ...` | **General write** — change any setting |
+| `get <OID> [attrs] [--gl] [--stack S] [--json]` | **General read** — any object, friendly or JSON |
+| `set <OID> attr=val ... [--stack S]` | **General write** — change any setting |
 | `config --password ...` | Save host + password (mode 600) |
+
+**Change Wi-Fi over the web** (the web-UI alternative to `telnet wlctl set`):
+```bash
+tpwrctl wifi --dry-run --ssid MyNet --password 'secret123'   # preview — sends nothing
+tpwrctl wifi --password 'secret123'                          # set the key (asks to confirm)
+tpwrctl wifi --bandwidth 20M                                 # Auto | 20M | 40M
+tpwrctl wifi --radio off                                     # turn the radio off/on
+```
+> ⚠️ Changing Wi-Fi restarts the radio — connected clients drop for a few seconds.
 
 ### Over the telnet CLI (for the few settings only it exposes)
 | Command | What it does |
 |---|---|
-| `telnet "<cmd>" [...]` | Run CLI command(s), output nicely formatted |
+| `telnet <cmd...>` | Run a CLI command (quotes optional), output nicely formatted |
 | `telnet --list` | 📖 Telnet CLI command reference |
-| `telnet --raw "<cmd>"` | Show the router's unprocessed text |
-| `telnet -y "dev reset"` | Destructive commands are guarded (`-y` required) |
+| `telnet --raw <cmd...>` | Show the router's unprocessed text |
+| `telnet -y dev reset` | Destructive commands are guarded (`-y` required) |
+
+```bash
+tpwrctl telnet dev serial show     # note: 'dev serial' alone isn't complete
+tpwrctl telnet wlctl show
+```
 
 **Two general tools, two transports:** `get`/`set` (+ `oids`) for the web API, and
 `telnet` (+ `telnet --list`) for the CLI. Use `oids` / `telnet --list` to discover what's available.

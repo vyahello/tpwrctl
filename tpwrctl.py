@@ -139,6 +139,24 @@ def _macnorm(m):
     return (m or "").upper().replace("-", ":")
 
 
+def _wifi_sec(ap):
+    """Human-readable Wi-Fi security mode from a LAN_WLAN entry (uses beaconType)."""
+    bt = ap.get("beaconType", "")
+    enc = ap.get("IEEE11iEncryptionModes", "") or ap.get("WPAEncryptionModes", "")
+    cipher = "AES" if ("AES" in enc and "TKIP" not in enc) else ("TKIP+AES" if "AES" in enc else "TKIP")
+    psk = "PSKAuthentication" in (ap.get("IEEE11iAuthenticationMode", ""), ap.get("WPAAuthenticationMode", ""))
+    kind = "PSK" if psk else "Enterprise"
+    if bt == "Basic":
+        return "Open (no password)" if ap.get("basicEncryptionModes") == "None" else "WEP"
+    if bt == "WPA":
+        return "WPA-%s (%s)" % (kind, cipher)
+    if "WPAand11i" in bt:
+        return "WPA/WPA2-%s (%s)" % (kind, cipher)
+    if bt == "11i":
+        return "WPA2-%s (%s)" % (kind, cipher)
+    return "WPA2-%s (%s)" % (kind, cipher) if psk else "Open/Unknown"
+
+
 def devices(r):
     hosts = r.getlist("LAN_HOST_ENTRY")
     try:
@@ -208,11 +226,57 @@ def cmd_wan(r, args):
             print("%-22s %s" % (k, w[k]))
 
 
+def _wifi_set(r, args, changes):
+    """Apply changes to the main Wi-Fi radio (LAN_WLAN), using its real stack."""
+    ap = (r.getlist("LAN_WLAN") or [{}])[0]
+    stack = ap.get("__stack") or "1,1,0,0,0,0"
+    print("Wi-Fi changes on SSID '%s' (stack %s):" % (ap.get("SSID", "?"), stack))
+    for k, v in changes.items():
+        print("  %-18s -> %s" % (k, v))
+    print("\n\033[33m! This restarts the radio; Wi-Fi clients will briefly disconnect.\033[0m"
+          if sys.stdout.isatty() else "\n! This restarts the radio; Wi-Fi clients will briefly disconnect.")
+    if args.dry_run:
+        print("(dry-run: nothing sent)")
+        return
+    if not args.yes and input("Apply? [y/N] ").strip().lower() != "y":
+        print("aborted.")
+        return
+    r.cgi([{"action": ACT_SET, "oid": "LAN_WLAN", "stack": stack, "attrs": changes}])
+    print("applied.")
+
+
 def cmd_wifi(r, args):
+    # If any set-flag was given, change settings instead of showing them.
+    changes = {}
+    if getattr(args, "ssid", None) is not None:
+        changes["SSID"] = args.ssid
+    if getattr(args, "psk", None) is not None:
+        changes["X_TP_PreSharedKey"] = args.psk
+    if getattr(args, "bandwidth", None) is not None:
+        changes["X_TP_Bandwidth"] = args.bandwidth
+    if getattr(args, "radio", None) is not None:
+        changes["enable"] = "1" if args.radio == "on" else "0"
+    if changes:
+        return _wifi_set(r, args, changes)
+
+    # Otherwise: show access-point config (SSID + security + password) + clients.
+    ap = (r.getlist("LAN_WLAN") or [{}])[0]
+    print("Access point")
+    print("  SSID       : %s" % ap.get("SSID", "?"))
+    print("  Status     : %s" % ap.get("status", "?"))
+    print("  Band       : %s, channel %s%s" % (
+        ap.get("X_TP_Band", "?"), ap.get("channel", "?"),
+        " (auto)" if ap.get("autoChannelEnable") == "1" else ""))
+    print("  Bandwidth  : %s" % ap.get("X_TP_Bandwidth", "?"))
+    print("  Security   : %s" % _wifi_sec(ap))
+    print("  Password   : %s" % (ap.get("X_TP_PreSharedKey", "") or "(none/open)"))
+    # Associated clients.
     a = r.getlist("LAN_WLAN_ASSOC_DEV")
-    print("%-17s %-7s %-9s %-6s %-12s %s" % ("MAC", "SIGNAL", "LINKRATE", "STD", "BW", "TX/RX rate"))
+    print("\nClients (%d):" % len(a))
+    if a:
+        print("  %-17s %-7s %-8s %-4s %-6s %s" % ("MAC", "SIGNAL", "LINK", "STD", "BW", "TX/RX"))
     for d in a:
-        print("%-17s %-7s %-9s %-6s %-12s %s/%s" % (
+        print("  %-17s %-7s %-8s %-4s %-6s %s/%s" % (
             _macnorm(d.get("associatedDeviceMACAddress")),
             d.get("X_TP_StaSignalStrength", "") + "dBm",
             d.get("X_TP_StaConnectionSpeed", "") + "M",
@@ -332,6 +396,7 @@ WEB_OIDS = """Useful web-API objects  (read: 'get OID' | 'get OID --gl' ; write:
   WAN_IP_CONN         (gl) Internet status, public IP, gateway, DNS
   WAN_COMMON_INTF_CFG      WAN interface info
   LAN_HOST_ENTRY      (gl) every known LAN device (wired + Wi-Fi)
+  LAN_WLAN            (gl) Wi-Fi AP config: SSID, security, password (X_TP_PreSharedKey)
   LAN_WLAN_ASSOC_DEV  (gl) associated Wi-Fi clients + signal/rates
   UPNP_CFG                 UPnP on/off          (set enable=0 to disable)
   CWMP_CFG                 TR-069 / CWMP config
@@ -347,7 +412,8 @@ Examples:
 
 def cmd_get(r, args):
     """General web read: fetch any object with ACT_GET (or ACT_GL via --gl)."""
-    rows = r.getlist(args.oid) if args.gl else [r.get(args.oid, args.attrs or None)]
+    rows = (r.getlist(args.oid, args.stack) if args.gl
+            else [r.get(args.oid, args.attrs or None, args.stack)])
     if args.json:
         print(json.dumps(rows, indent=2))
         return
@@ -369,7 +435,7 @@ def cmd_get(r, args):
 def cmd_set(r, args):
     """General web write: set one or more attr=val on an object."""
     attrs = dict(kv.split("=", 1) for kv in args.attrs)
-    r.set(args.oid, attrs)
+    r.set(args.oid, attrs, args.stack)
     print("OK: set %s %s" % (args.oid, attrs))
 
 
@@ -394,10 +460,12 @@ TELNET_HELP = """TP-Link TL-WR850N telnet CLI command reference (discovered):
   igmp ...             IGMP config
   clear | history | help | logout
 
-Examples:
-  tpwrctl telnet "dev version"
-  tpwrctl telnet "lan show info" "wlctl show"
-Note: not a shell - commands like cat/ls/ifconfig do NOT exist here."""
+Examples (quotes optional):
+  tpwrctl telnet dev version
+  tpwrctl telnet dev serial show
+  tpwrctl telnet lan show info
+Note: some commands need a sub-command (e.g. 'dev serial' -> 'dev serial show').
+Not a shell - commands like cat/ls/ifconfig do NOT exist here."""
 
 
 def _tn_negotiate(sock, data):
@@ -575,10 +643,12 @@ def cmd_telnet(host, password, args):
         if not args.list:
             print("\n(no command given)")
         return
-    for c in args.commands:
-        if "reset" in c.lower() and not args.yes:
-            sys.exit("refusing '%s' (looks like a factory reset). Re-run with -y to force." % c)
-    for cmd, out in telnet_exec(host, password, args.commands):
+    # Join all words into a single command, so quotes are optional:
+    #   tpwrctl telnet dev serial show   ==   tpwrctl telnet "dev serial show"
+    command = " ".join(args.commands)
+    if "reset" in command.lower() and not args.yes:
+        sys.exit("refusing '%s' (looks like a factory reset). Re-run with -y to force." % command)
+    for cmd, out in telnet_exec(host, password, [command]):
         print("\033[1m$ %s\033[0m" % cmd if sys.stdout.isatty() else "$ %s" % cmd)
         print(out if args.raw else _tn_friendly(cmd, out))
         print()
@@ -621,7 +691,15 @@ def main():
     d = sub.add_parser("devices", help="list connected devices"); d.set_defaults(fn=cmd_devices)
     d.add_argument("--online", action="store_true", help="only currently-connected devices")
     sub.add_parser("wan", help="WAN/Internet connection details").set_defaults(fn=cmd_wan)
-    sub.add_parser("wifi", help="associated Wi-Fi clients + signal/rates").set_defaults(fn=cmd_wifi)
+    wf = sub.add_parser("wifi", help="show Wi-Fi (SSID/security/password/clients); flags change it")
+    wf.set_defaults(fn=cmd_wifi)
+    wf.add_argument("--ssid", help="set the network name (SSID)")
+    # dest=psk so this does NOT clobber the global --password (admin login)
+    wf.add_argument("--password", dest="psk", help="set the WPA2 pre-shared key")
+    wf.add_argument("--bandwidth", choices=["Auto", "20M", "40M"], help="set channel width")
+    wf.add_argument("--radio", choices=["on", "off"], help="turn the Wi-Fi radio on/off")
+    wf.add_argument("--dry-run", action="store_true", help="show what would change, send nothing")
+    wf.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     sp = sub.add_parser("speed", help="live per-client Wi-Fi throughput"); sp.set_defaults(fn=cmd_speed)
     sp.add_argument("--interval", type=float, default=2.0)
     sub.add_parser("firmware", help="firmware version + update advice").set_defaults(fn=cmd_firmware)
@@ -633,12 +711,14 @@ def main():
     g.set_defaults(fn=cmd_get)
     g.add_argument("oid"); g.add_argument("attrs", nargs="*")
     g.add_argument("--gl", action="store_true", help="fetch a list/table (ACT_GL)")
+    g.add_argument("--stack", help="object stack, e.g. 1,1,0,0,0,0 (for nested objects)")
     g.add_argument("--json", action="store_true", help="raw JSON output")
     st = sub.add_parser("set", help="general web write: set OID attrs (attr=val ...)")
     st.set_defaults(fn=cmd_set); st.add_argument("oid"); st.add_argument("attrs", nargs="+")
+    st.add_argument("--stack", help="object stack, e.g. 1,1,0,0,0,0 (for nested objects)")
     sub.add_parser("oids", help="list useful web-API objects (web counterpart of 'telnet --list')")
     tn = sub.add_parser("telnet", help="run command(s) in the router's telnet CLI")
-    tn.add_argument("commands", nargs="*", help='e.g. "dev version" "lan show info"')
+    tn.add_argument("commands", nargs="*", help="e.g. dev serial show   (quotes optional)")
     tn.add_argument("--list", action="store_true", help="show the telnet CLI command reference")
     tn.add_argument("--raw", action="store_true", help="show unformatted CLI output")
     tn.add_argument("-y", "--yes", action="store_true", help="allow destructive commands (reset)")
