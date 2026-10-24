@@ -240,9 +240,23 @@ def cmd_wan(r, args):
             print("%-22s %s" % (k, w[k]))
 
 
+def _wlan_load(r):
+    """The main LAN_WLAN entry. Blank wireless MAC-filter rows (e.g. left by a TR-069 AddObject
+    on X_TP_MACTableEntry) make the firmware fail every LAN_WLAN read with error 1; say so."""
+    try:
+        return (r.getlist("LAN_WLAN") or [{}])[0]
+    except RuntimeError:
+        blank = [e for e in r.getlist("LAN_WLAN_MACTABLEENTRY") if not e.get("MACAddress")]
+        if blank:
+            raise RuntimeError("router can't load its Wi-Fi config: %d blank wireless MAC-filter "
+                               "row(s) (LAN_WLAN_MACTABLEENTRY stack %s) break it"
+                               % (len(blank), ", ".join(e["__stack"] for e in blank)))
+        raise
+
+
 def _wifi_set(r, args, changes):
     """Apply changes to the main Wi-Fi radio (LAN_WLAN), using its real stack."""
-    ap = (r.getlist("LAN_WLAN") or [{}])[0]
+    ap = _wlan_load(r)
     stack = ap.get("__stack") or "1,1,0,0,0,0"
     print("Wi-Fi changes on SSID '%s' (stack %s):" % (ap.get("SSID", "?"), stack))
     for k, v in changes.items():
@@ -274,7 +288,7 @@ def cmd_wifi(r, args):
         return _wifi_set(r, args, changes)
 
     # Otherwise: show access-point config (SSID + security + password) + clients.
-    ap = (r.getlist("LAN_WLAN") or [{}])[0]
+    ap = _wlan_load(r)
     print("Access point")
     print("  SSID       : %s" % ap.get("SSID", "?"))
     print("  Status     : %s" % ap.get("status", "?"))
@@ -744,6 +758,12 @@ def _inform(dev):
     return (dev.get("_lastInform", "?") or "?")[:19]
 
 
+def _read_at(dev, node):
+    """When the ACS last read a cached parameter (it can be far older than the last inform)."""
+    ts = node.get("_timestamp") if isinstance(node, dict) else None
+    return ts[:19] if ts else _inform(dev)
+
+
 def cmd_acs_status(base, args):
     dev = _acs_device(base, _acs_pick(base, args.id))
     root = _root(dev); di = root + ".DeviceInfo"
@@ -754,9 +774,9 @@ def cmd_acs_status(base, args):
     print("Firmware    : %s" % _param(dev, di + ".SoftwareVersion"))
     print("Uptime      : %s" % _hms(_param(dev, di + ".UpTime")))
     print("WAN         : %s   IP %s" % (_param(dev, wan + ".ConnectionStatus"), _param(dev, wan + ".ExternalIPAddress")))
-    print("Wi-Fi       : %s  (%s, ch %s, %s)" % (
+    print("Wi-Fi       : %s  (%s, ch %s, %s)  [read %s UTC]" % (
         _nval(w.get("SSID")), "on" if _truthy(_nval(w.get("Enable"))) else "off",
-        _nval(w.get("Channel")), _acs_wifi_sec(w)))
+        _nval(w.get("Channel")), _acs_wifi_sec(w), _read_at(dev, w.get("Enable"))))
     print("Clients     : %d active  (%d known)" % (active, len(hosts)))
     print("Last inform : %s UTC" % _inform(dev))
 
@@ -806,7 +826,8 @@ def cmd_acs_wifi(base, args):
     print("Security   : %s" % _acs_wifi_sec(w))
     key = _nval(w.get("X_TP_PreSharedKey"))
     print("Password   : %s" % (key if key else "(write-only over TR-069 - read with local 'tpwrctl wifi')"))
-    print("[cached from last inform %s UTC; 'acs refresh' to update]" % _inform(dev))
+    print("[cached: read %s UTC, last inform %s UTC; 'acs refresh' to update]"
+          % (_read_at(dev, w.get("SSID")), _inform(dev)))
 
 
 def cmd_acs_wan(base, args):
@@ -876,8 +897,8 @@ _TN_REF = [
         ("dev serial show", "serial number"),
     ]),
     ("Device control", [
-        ("dev reboot", "reboot the router"),
-        ("dev reset", "FACTORY RESET  (guarded; needs -y)"),
+        ("dev reboot", "says cmd:SUCC but did nothing here; use 'tpwrctl reboot'"),
+        ("dev reset", "factory reset (guarded; needs -y) - also a no-op here"),
     ]),
     ("LAN / DHCP", [
         ("lan show info", "full LAN + DHCP configuration"),

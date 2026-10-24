@@ -119,7 +119,15 @@ ones. Writes queue and apply on the next inform (see the double-NAT note).
 
 **Blocking over TR-069 isn't supported on this router.** Access Control (wired+wireless) isn't in
 the data model, and the wireless MAC-filter table faults on writes (`SetParameterValues`→9003,
-`DeleteObject`→7501), so a per-MAC block can't be applied remotely. Working alternatives:
+`DeleteObject`→7501), so a per-MAC block can't be applied remotely.
+
+> ⚠️ **Never `AddObject` on `WLANConfiguration.1.X_TP_MACTableEntry.`** It *succeeds*, but the
+> new row can't be filled in or deleted, and one blank row makes the firmware fail every
+> Wi-Fi read (`wifi` → error 1). After the next reboot the access point is gone. No API
+> (web, TR-069, telnet) can remove the row; the only way out is a factory reset (Reset button,
+> or the web UI's Factory Restore — telnet `dev reset` is a no-op), then reconfigure.
+
+Working alternatives:
 `acs wifi --password <new>` (rotate the key — kicks all Wi-Fi clients), `acs wifi --radio off`
 (turn Wi-Fi off), or the LAN-side `block <MAC>` for targeted wired+wireless blocking. The Wi-Fi
 password is **write-only** over TR-069 (settable, not readable — read it on the LAN with `wifi`).
