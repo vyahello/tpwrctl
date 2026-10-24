@@ -446,26 +446,83 @@ def cmd_set(r, args):
 # else; this wrapper is for the few things the CLI exposes directly.
 _IAC, _DONT, _DO, _WONT, _WILL, _SB, _SE = 255, 254, 253, 252, 251, 250, 240
 _PROMPT = re.compile(rb"TP-Link(\([^)]*\))?[#>]\s*$")
-TELNET_HELP = """TP-Link TL-WR850N telnet CLI command reference (discovered):
+def _color_enabled():
+    """Match argparse (3.14) help coloring: honor NO_COLOR/FORCE_COLOR/PYTHON_COLORS, else TTY."""
+    pc = os.environ.get("PYTHON_COLORS")
+    if pc == "0":
+        return False
+    if pc == "1":
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    if os.environ.get("TERM") == "dumb":
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
 
-  dev version          firmware version
-  dev serial           serial number
-  dev show             device info
-  dev reboot           reboot the router
-  dev reset            FACTORY RESET  (destructive; needs -y)
-  lan show info        LAN configuration
-  lan show status      LAN status
-  wlctl show           wireless configuration / clients
-  wlctl set [...]      change wireless (ssid/bandWidth/switch/sec/...); see 'wlctl'
-  igmp ...             IGMP config
-  clear | history | help | logout
 
-Examples (quotes optional):
-  tpwrctl telnet dev version
-  tpwrctl telnet dev serial show
-  tpwrctl telnet lan show info
-Note: some commands need a sub-command (e.g. 'dev serial' -> 'dev serial show').
-Not a shell - commands like cat/ls/ifconfig do NOT exist here."""
+# Telnet CLI reference, as data so it can be rendered plain or colored.
+_TN_REF = [
+    ("Device info", [
+        ("dev version", "firmware version"),
+        ("dev show prodName", "model name"),
+        ("dev show prodHardVer", "hardware version"),
+        ("dev show prodSoftVer", "firmware string (same as 'dev version')"),
+        ("dev serial show", "serial number"),
+    ]),
+    ("Device control", [
+        ("dev reboot", "reboot the router"),
+        ("dev reset", "FACTORY RESET  (guarded; needs -y)"),
+    ]),
+    ("LAN / DHCP", [
+        ("lan show info", "full LAN + DHCP configuration"),
+        ("lan show status", "LAN status"),
+    ]),
+    ("Wireless", [
+        ("wlctl show", "SSID, security, key, radio status"),
+        ("wlctl set [...]", "change Wi-Fi (run 'wlctl set' alone to list its options)"),
+    ]),
+    ("Multicast", [
+        ("igmp showProxy", "IGMP proxy state"),
+        ("igmp showSnoop", "IGMP snooping state"),
+    ]),
+    ("Session", [
+        ("clear | history | help | logout", ""),
+    ]),
+]
+_TN_EXAMPLES = [
+    "tpwrctl telnet dev version",
+    "tpwrctl telnet dev serial show",
+    "tpwrctl telnet lan show info",
+    "tpwrctl telnet --raw wlctl show",
+]
+_TN_NOTES = [
+    "Not a shell: cat / ls / ifconfig / enable do NOT exist.",
+    "Some commands need a sub-command (e.g. 'dev serial' -> 'dev serial show').",
+    "Only one telnet session at a time; close the web UI / other session first.",
+    "Plaintext protocol -- prefer the web commands on untrusted networks.",
+]
+
+
+def telnet_help(color=None):
+    """Render the telnet CLI reference, colored (matching argparse) when appropriate."""
+    if color is None:
+        color = _color_enabled()
+    head = (lambda s: "\033[1;34m%s\033[0m" % s) if color else (lambda s: s)   # bold blue
+    cmd = (lambda s: "\033[1;32m%s\033[0m" % s) if color else (lambda s: s)    # bold green
+    title = (lambda s: "\033[1m%s\033[0m" % s) if color else (lambda s: s)     # bold
+    out = [title("TP-Link telnet CLI reference  (port 23; quotes optional)"), ""]
+    for section, rows in _TN_REF:
+        out.append(head(section))
+        for name, desc in rows:
+            out.append("  " + cmd("%-24s" % name) + ((" " + desc) if desc else ""))
+    out += ["", head("Examples")] + ["  " + e for e in _TN_EXAMPLES]
+    out += ["", head("Notes")] + ["  * " + n for n in _TN_NOTES]
+    return "\n".join(out)
 
 
 def _tn_negotiate(sock, data):
@@ -639,7 +696,7 @@ def _tn_friendly(cmd, out):
 
 def cmd_telnet(host, password, args):
     if args.list or not args.commands:
-        print(TELNET_HELP)
+        print(telnet_help())
         if not args.list:
             print("\n(no command given)")
         return
@@ -717,11 +774,27 @@ def main():
     st.set_defaults(fn=cmd_set); st.add_argument("oid"); st.add_argument("attrs", nargs="+")
     st.add_argument("--stack", help="object stack, e.g. 1,1,0,0,0,0 (for nested objects)")
     sub.add_parser("oids", help="list useful web-API objects (web counterpart of 'telnet --list')")
-    tn = sub.add_parser("telnet", help="run command(s) in the router's telnet CLI")
-    tn.add_argument("commands", nargs="*", help="e.g. dev serial show   (quotes optional)")
-    tn.add_argument("--list", action="store_true", help="show the telnet CLI command reference")
-    tn.add_argument("--raw", action="store_true", help="show unformatted CLI output")
-    tn.add_argument("-y", "--yes", action="store_true", help="allow destructive commands (reset)")
+    tn = sub.add_parser(
+        "telnet",
+        help="run a command in the router's telnet CLI",
+        description=(
+            "Drive the router's built-in telnet CLI (port 23).\n"
+            "It is a restricted, proprietary command tree -- NOT a Unix shell\n"
+            "(no cat/ls/ifconfig). Only one telnet session is allowed at a time,\n"
+            "and the channel is plaintext. All words are joined into a single\n"
+            "command, so quotes are optional:  tpwrctl telnet dev serial show"
+        ),
+        epilog=telnet_help(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    tn.add_argument("commands", nargs="*", metavar="CMD",
+                    help="CLI command words, e.g. dev serial show (quotes optional)")
+    tn.add_argument("--list", action="store_true",
+                    help="print the full CLI command reference and exit")
+    tn.add_argument("--raw", action="store_true",
+                    help="show the router's unformatted output instead of the tidy view")
+    tn.add_argument("-y", "--yes", action="store_true",
+                    help="allow a destructive command (dev reset) without the safety stop")
     cf = sub.add_parser("config", help="save host+password to ~/.config/tpwrctl"); cf.set_defaults(fn=cmd_config)
     cf.add_argument("--host", default="192.168.1.1"); cf.add_argument("--password")
 
@@ -731,7 +804,7 @@ def main():
     if args.cmd == "oids":                       # reference only, no login needed
         print(WEB_OIDS); return
     if args.cmd == "telnet" and args.list and not args.commands:
-        print(TELNET_HELP); return
+        print(telnet_help()); return
     host, pw = resolve_creds(args)
     if args.cmd == "telnet":
         try:
