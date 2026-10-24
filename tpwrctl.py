@@ -135,6 +135,17 @@ def _fw_date(ver):
     return "20%s-%s-%s" % (m.group(1), m.group(2), m.group(3)) if m else "?"
 
 
+def _fmt_uptime(proc):
+    """Uptime from PROC_STATUS X_TP_TotalTime (kernel CPU time, 1/100 s), or None."""
+    tt = proc.get("X_TP_TotalTime", "")
+    if not tt.isdigit():
+        return None
+    secs = int(tt) // 100
+    d, rem = divmod(secs, 86400)
+    h, m = divmod(rem, 3600)[0], (rem % 3600) // 60
+    return "%dd %dh %dm" % (d, h, m) if d else "%dh %dm" % (h, m)
+
+
 def _macnorm(m):
     return (m or "").upper().replace("-", ":")
 
@@ -187,13 +198,16 @@ def cmd_status(r, args):
     info = r.get("IGD_DEV_INFO", ["modelName", "description", "softwareVersion", "hardwareVersion"])
     wan = (r.getlist("WAN_IP_CONN") or [{}])[0]
     try:
-        cpu = r.get("PROC_STATUS", ["CPUUsage"]).get("CPUUsage", "?")
+        proc = r.get("PROC_STATUS", ["CPUUsage", "X_TP_TotalTime"])
     except Exception:
-        cpu = "?"
+        proc = {}
+    cpu = proc.get("CPUUsage", "?")
+    uptime = _fmt_uptime(proc) or "?"
     devs = devices(r)
     on = [d for d in devs if d["active"]]
     print("Model        : %s  (hw %s)" % (info.get("modelName"), info.get("hardwareVersion")))
     print("Firmware     : %s   [built %s]" % (info.get("softwareVersion"), _fw_date(info.get("softwareVersion"))))
+    print("Uptime       : %s" % uptime)
     print("WAN          : %s  via %s" % (wan.get("connectionStatus", "?"), wan.get("connectionType", "?")))
     print("Public IP    : %s" % wan.get("externalIPAddress", "?"))
     print("Gateway/DNS  : %s  /  %s" % (wan.get("defaultGateway", "?"), wan.get("DNSServers", "?")))
@@ -327,10 +341,9 @@ def cmd_firmware(r, args):
 def cmd_cpu(r, args):
     p = r.get("PROC_STATUS", ["CPUUsage", "X_TP_TotalTime", "X_TP_IdleTime"])
     print("CPU usage : %s%%" % p.get("CPUUsage", "?"))
-    tt = p.get("X_TP_TotalTime");
-    if tt and tt.isdigit():
-        secs = int(tt) // 100
-        print("Uptime    : ~%dh %dm (approx, from CPU time)" % (secs // 3600, (secs % 3600) // 60))
+    up = _fmt_uptime(p)
+    if up:
+        print("Uptime    : %s" % up)
 
 
 def cmd_reboot(r, args):
