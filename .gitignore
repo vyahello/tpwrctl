@@ -13,3 +13,7 @@ config.json
 *.local
 *.log
 *.pcap
+
+# ACS secrets
+.env
+deploy/genieacs/.env

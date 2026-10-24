@@ -1,0 +1,79 @@
+name: genieacs
+
+# GenieACS ACS for the TP-Link router.
+#   cwmp  -> public on :7547 (the router connects here; ufw limits the source to the router WAN IP)
+#   nbi   -> localhost:7557  (REST API that `tpwrctl acs ...` drives)
+#   ui    -> localhost:3000  (web UI; reach via SSH tunnel)
+#   fs    -> localhost:7567  (firmware file server; local only for now)
+
+x-genieacs-env: &genieacs-env
+  GENIEACS_MONGODB_CONNECTION_URL: "mongodb://mongo:27017/genieacs"
+  GENIEACS_UI_JWT_SECRET: "${GENIEACS_UI_JWT_SECRET:?set GENIEACS_UI_JWT_SECRET in .env}"
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [acs]
+
+  cwmp:
+    build: .
+    image: genieacs-local:1.2.13
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment: *genieacs-env
+    command: genieacs-cwmp
+    ports:
+      - "7547:7547"
+    networks: [acs]
+
+  nbi:
+    image: genieacs-local:1.2.13
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment: *genieacs-env
+    command: genieacs-nbi
+    ports:
+      - "127.0.0.1:7557:7557"
+    networks: [acs]
+
+  fs:
+    image: genieacs-local:1.2.13
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment: *genieacs-env
+    command: genieacs-fs
+    ports:
+      - "127.0.0.1:7567:7567"
+    networks: [acs]
+
+  ui:
+    image: genieacs-local:1.2.13
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment: *genieacs-env
+    command: genieacs-ui
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [acs]
+
+volumes:
+  mongo-data:
+
+networks:
+  acs:

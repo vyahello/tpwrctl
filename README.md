@@ -96,6 +96,43 @@ tpwrctl telnet wlctl show
 **Two general tools, two transports:** `get`/`set` (+ `oids`) for the web API, and
 `telnet` (+ `telnet --list`) for the CLI. Use `oids` / `telnet --list` to discover what's available.
 
+### Over TR-069 / CWMP (true remote management, from anywhere)
+Point the router at a [GenieACS](deploy/genieacs/) server (e.g. on a cloud VM); then manage it
+remotely — no LAN access needed. `tpwrctl acs …` drives the ACS's REST API.
+
+| Command | What it does |
+|---|---|
+| `acs devices` | List devices (CPEs) the ACS manages |
+| `acs status` | One-screen overview (model, firmware, uptime, WAN, Wi-Fi, clients) |
+| `acs clients [--online]` | Connected LAN hosts (name, IP, MAC) |
+| `acs wifi` | Show Wi-Fi (SSID, security, password, channel) |
+| `acs wifi --ssid/--password/--radio` | Change Wi-Fi (confirms; `--dry-run` to preview) |
+| `acs wan` | WAN/Internet details |
+| `acs firmware` | Firmware / model / uptime |
+| `acs reboot [-y]` | Reboot the router |
+| `acs refresh [--object O]` | Re-read the device's parameters |
+| `acs params` | Dump the full TR-069 parameter tree |
+| `acs get <param>` / `acs set <param> <value>` | Read / write any TR-069 parameter |
+
+Reads show the values from the last inform (shown with a timestamp); `acs refresh` pulls fresh
+ones. Writes queue and apply on the next inform (see the double-NAT note).
+
+**Blocking over TR-069 isn't supported on this router.** Access Control (wired+wireless) isn't in
+the data model, and the wireless MAC-filter table faults on writes (`SetParameterValues`→9003,
+`DeleteObject`→7501), so a per-MAC block can't be applied remotely. Working alternatives:
+`acs wifi --password <new>` (rotate the key — kicks all Wi-Fi clients), `acs wifi --radio off`
+(turn Wi-Fi off), or the LAN-side `block <MAC>` for targeted wired+wireless blocking. The Wi-Fi
+password is **write-only** over TR-069 (settable, not readable — read it on the LAN with `wifi`).
+
+```bash
+tpwrctl set MANAGEMENT_SERVER URL=http://<VM_IP>:7547/   # one-time: aim the router at the ACS
+tpwrctl acs devices
+tpwrctl acs reboot
+```
+Setup and deployment: **[deploy/genieacs/README.md](deploy/genieacs/README.md)**. The NBI is
+localhost-only, so run `acs` commands on the ACS host (or set `--acs-url` / `$TPWRCTL_ACS`).
+Behind double-NAT, tasks queue and run on the next inform (≤ the inform interval).
+
 ## ✨ Looks like
 
 ```

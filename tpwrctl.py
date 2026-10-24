@@ -563,6 +563,283 @@ def cmd_blocklist(r, args):
         print("  %-18s %-17s %s" % (n[:18], m, status))
 
 
+# ----------------------------------------------------------------------------- ACS / TR-069
+# Manage the router through its TR-069 ACS (GenieACS). These commands talk to the GenieACS
+# NBI (REST API), default http://localhost:7557 -- run them on the ACS host (the Oracle VM).
+def _acs_base(args):
+    return (getattr(args, "acs_url", None) or os.environ.get("TPWRCTL_ACS")
+            or load_conf().get("acs_url") or "http://localhost:7557")
+
+
+def _q(s):
+    from urllib.parse import quote
+    return quote(s, safe="")
+
+
+def _acs_get(base, path):
+    r = requests.get(base.rstrip("/") + path, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError("ACS GET %s -> HTTP %s" % (path, r.status_code))
+    return r.json()
+
+
+def _acs_device(base, did):
+    # GenieACS has no GET /devices/<id>; query by _id instead.
+    devs = _acs_get(base, "/devices/?query=" + _q(json.dumps({"_id": did})))
+    if not devs:
+        raise RuntimeError("device %s not found on the ACS" % did)
+    return devs[0]
+
+
+def _acs_task(base, did, body):
+    """POST a task with a connection request; report whether it ran now or was queued."""
+    r = requests.post(base.rstrip("/") + "/devices/%s/tasks" % _q(did),
+                      params={"connection_request": ""}, data=json.dumps(body),
+                      headers={"Content-Type": "application/json"}, timeout=40)
+    if r.status_code >= 400:
+        raise RuntimeError("task %s -> HTTP %s %s" % (body.get("name"), r.status_code, r.text[:200]))
+    return "applied now" if r.status_code == 200 else "queued (runs on the next inform, <=5 min)"
+
+
+def _acs_pick(base, explicit):
+    if explicit:
+        return explicit
+    devs = _acs_get(base, "/devices/")
+    if not devs:
+        raise RuntimeError("the ACS knows no devices yet - has the router informed? (set its ACS URL)")
+    if len(devs) > 1:
+        raise RuntimeError("several devices; pass --id (%s)" % ", ".join(d.get("_id", "?") for d in devs))
+    return devs[0]["_id"]
+
+
+def _param(dev, path):
+    """Return a parameter's _value by dotted path, or None."""
+    n = _node(dev, path)
+    return _nval(n)
+
+
+def _node(dev, path):
+    cur = dev
+    for p in path.split("."):
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        else:
+            return None
+    return cur
+
+
+def _nval(node):
+    return node.get("_value") if isinstance(node, dict) and "_value" in node else None
+
+
+def _rows(dev, path):
+    """Numbered table instances under path, as (index, subtree), in numeric order."""
+    node = _node(dev, path) or {}
+    return [(k, v) for k, v in sorted(node.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0)
+            if k.isdigit() and isinstance(v, dict)]
+
+
+def _truthy(v):
+    return str(v).lower() in ("true", "1", "yes")
+
+
+def _hms(secs):
+    try:
+        s = int(secs)
+    except (TypeError, ValueError):
+        return "?"
+    d, r = divmod(s, 86400)
+    h, m = r // 3600, (r % 3600) // 60
+    return "%dd %dh %dm" % (d, h, m) if d else "%dh %dm" % (h, m)
+
+
+def _root(dev):  # data model root differs by device
+    return "InternetGatewayDevice" if "InternetGatewayDevice" in dev else "Device"
+
+
+def _acs_wifi_sec(w):
+    """Human-readable Wi-Fi security from a WLANConfiguration subtree."""
+    bt = _nval(w.get("BeaconType")) or ""
+    enc = _nval(w.get("IEEE11iEncryptionModes")) or _nval(w.get("WPAEncryptionModes")) or ""
+    cipher = "AES" if ("AES" in enc and "TKIP" not in enc) else ("TKIP+AES" if "AES" in enc else "TKIP")
+    psk = "PSKAuthentication" in (_nval(w.get("IEEE11iAuthenticationMode")) or "",
+                                  _nval(w.get("WPAAuthenticationMode")) or "")
+    kind = "PSK" if psk else "Enterprise"
+    if bt == "Basic":
+        return "Open" if _nval(w.get("BasicEncryptionModes")) == "None" else "WEP"
+    if "11i" in bt and "WPA" in bt:
+        return "WPA/WPA2-%s (%s)" % (kind, cipher)
+    if bt == "WPA":
+        return "WPA-%s (%s)" % (kind, cipher)
+    if bt == "11i":
+        return "WPA2-%s (%s)" % (kind, cipher)
+    return "WPA2-%s (%s)" % (kind, cipher) if psk else "Open/Unknown"
+
+
+# Convenience path builders (all devices here use the InternetGatewayDevice model).
+def _p_wlan(root):
+    return root + ".LANDevice.1.WLANConfiguration.1"
+
+
+def _p_wan(root):
+    return root + ".WANDevice.1.WANConnectionDevice.1.WANIPConnection.1"
+
+
+def _p_hosts(root):
+    return root + ".LANDevice.1.Hosts.Host"
+
+
+def cmd_acs_devices(base, args):
+    devs = _acs_get(base, "/devices/")
+    if not devs:
+        print("no devices registered yet (waiting for the router to inform the ACS)"); return
+    print("%-34s %-12s %-21s %s" % ("ID", "MODEL", "LAST INFORM (UTC)", "FIRMWARE"))
+    for d in devs:
+        root = _root(d)
+        print("%-34s %-12s %-21s %s" % (
+            d.get("_id", "?"),
+            _param(d, root + ".DeviceInfo.ModelName") or "?",
+            (d.get("_lastInform", "?") or "?")[:19],
+            _param(d, root + ".DeviceInfo.SoftwareVersion") or "?"))
+
+
+def cmd_acs_reboot(base, args):
+    did = _acs_pick(base, args.id)
+    if not args.yes and input("Reboot %s via TR-069? [y/N] " % did).strip().lower() != "y":
+        print("aborted."); return
+    print("reboot: " + _acs_task(base, did, {"name": "reboot"}))
+
+
+def cmd_acs_refresh(base, args):
+    did = _acs_pick(base, args.id)
+    print("refresh: " + _acs_task(base, did, {"name": "refreshObject", "objectName": args.object}))
+
+
+def cmd_acs_get(base, args):
+    did = _acs_pick(base, args.id)
+    status = _acs_task(base, did, {"name": "getParameterValues", "parameterNames": [args.param]})
+    val = _param(_acs_device(base, did), args.param)
+    print("%s = %s   [refresh %s]" % (args.param, val, status))
+
+
+def cmd_acs_set(base, args):
+    did = _acs_pick(base, args.id)
+    body = {"name": "setParameterValues", "parameterValues": [[args.param, args.value]]}
+    print("set %s = %s : %s" % (args.param, args.value, _acs_task(base, did, body)))
+
+
+def cmd_acs_params(base, args):
+    dev = _acs_device(base, _acs_pick(base, args.id))
+    def walk(o, pfx=""):
+        if isinstance(o, dict):
+            if "_value" in o:
+                print("  %s = %s" % (pfx, o["_value"])); return
+            for k, v in o.items():
+                if not k.startswith("_"):
+                    walk(v, (pfx + "." + k) if pfx else k)
+    walk(dev)
+
+
+def _inform(dev):
+    return (dev.get("_lastInform", "?") or "?")[:19]
+
+
+def cmd_acs_status(base, args):
+    dev = _acs_device(base, _acs_pick(base, args.id))
+    root = _root(dev); di = root + ".DeviceInfo"
+    wan = _p_wan(root); w = _node(dev, _p_wlan(root)) or {}
+    hosts = _rows(dev, _p_hosts(root))
+    active = sum(1 for _, h in hosts if _truthy(_nval(h.get("Active"))))
+    print("Model       : %s  (hw %s)" % (_param(dev, di + ".ModelName"), _param(dev, di + ".HardwareVersion")))
+    print("Firmware    : %s" % _param(dev, di + ".SoftwareVersion"))
+    print("Uptime      : %s" % _hms(_param(dev, di + ".UpTime")))
+    print("WAN         : %s   IP %s" % (_param(dev, wan + ".ConnectionStatus"), _param(dev, wan + ".ExternalIPAddress")))
+    print("Wi-Fi       : %s  (%s, ch %s, %s)" % (
+        _nval(w.get("SSID")), "on" if _truthy(_nval(w.get("Enable"))) else "off",
+        _nval(w.get("Channel")), _acs_wifi_sec(w)))
+    print("Clients     : %d active  (%d known)" % (active, len(hosts)))
+    print("Last inform : %s UTC" % _inform(dev))
+
+
+def cmd_acs_clients(base, args):
+    dev = _acs_device(base, _acs_pick(base, args.id))
+    hosts = _rows(dev, _p_hosts(_root(dev)))
+    active_total = sum(1 for _, h in hosts if _truthy(_nval(h.get("Active"))))
+    rows = []
+    for _, h in hosts:
+        act = _truthy(_nval(h.get("Active")))
+        if args.online and not act:
+            continue
+        rows.append((_nval(h.get("HostName")) or "Unknown", _nval(h.get("IPAddress")) or "",
+                     _macnorm(_nval(h.get("MACAddress"))), _nval(h.get("AddressSource")) or "", act))
+    print("%-24s %-15s %-17s %-6s %s" % ("NAME", "IP", "MAC", "SRC", "STATE"))
+    for n, ip, mac, src, act in sorted(rows, key=lambda r: not r[4]):
+        print("%-24s %-15s %-17s %-6s %s" % (n[:24], ip, mac, src, "online" if act else "offline"))
+    print("\n%d active / %d known  [last inform %s UTC]" % (active_total, len(hosts), _inform(dev)))
+
+
+def cmd_acs_wifi(base, args):
+    did = _acs_pick(base, args.id)
+    dev = _acs_device(base, did); wl = _p_wlan(_root(dev))
+    changes = {}
+    if args.ssid is not None:
+        changes[wl + ".SSID"] = args.ssid
+    if args.psk is not None:
+        changes[wl + ".X_TP_PreSharedKey"] = args.psk
+    if args.radio is not None:
+        changes[wl + ".Enable"] = (args.radio == "on")
+    if changes:
+        print("Wi-Fi changes (via TR-069):")
+        for k, v in changes.items():
+            print("  %s = %s" % (k.split(".WLANConfiguration.1.")[-1], v))
+        if args.dry_run:
+            print("(dry-run: nothing sent)"); return
+        if not args.yes and input("Apply? [y/N] ").strip().lower() != "y":
+            print("aborted."); return
+        body = {"name": "setParameterValues", "parameterValues": [[k, v] for k, v in changes.items()]}
+        print("set: " + _acs_task(base, did, body)); return
+    w = _node(dev, wl) or {}
+    print("SSID       : %s" % _nval(w.get("SSID")))
+    print("Status     : %s" % ("on" if _truthy(_nval(w.get("Enable"))) else "off"))
+    print("Channel    : %s" % _nval(w.get("Channel")))
+    print("Band / BW  : %s / %s" % (_nval(w.get("X_TP_Band")), _nval(w.get("X_TP_Bandwidth"))))
+    print("Security   : %s" % _acs_wifi_sec(w))
+    key = _nval(w.get("X_TP_PreSharedKey"))
+    print("Password   : %s" % (key if key else "(write-only over TR-069 - read with local 'tpwrctl wifi')"))
+    print("[cached from last inform %s UTC; 'acs refresh' to update]" % _inform(dev))
+
+
+def cmd_acs_wan(base, args):
+    dev = _acs_device(base, _acs_pick(base, args.id)); wan = _p_wan(_root(dev))
+    for label, p in [("Status", "ConnectionStatus"), ("External IP", "ExternalIPAddress"),
+                     ("Gateway", "DefaultGateway"), ("DNS", "DNSServers"),
+                     ("MAC", "MACAddress"), ("Uptime", "Uptime")]:
+        v = _param(dev, wan + "." + p)
+        print("%-12s: %s" % (label, _hms(v) if p == "Uptime" else v))
+
+
+def cmd_acs_firmware(base, args):
+    dev = _acs_device(base, _acs_pick(base, args.id)); di = _root(dev) + ".DeviceInfo"
+    print("Model    : %s" % _param(dev, di + ".ModelName"))
+    print("Hardware : %s" % _param(dev, di + ".HardwareVersion"))
+    print("Firmware : %s" % _param(dev, di + ".SoftwareVersion"))
+    print("Uptime   : %s" % _hms(_param(dev, di + ".UpTime")))
+
+
+def cmd_acs(args):
+    base = _acs_base(args)
+    handlers = {"devices": cmd_acs_devices, "status": cmd_acs_status, "clients": cmd_acs_clients,
+                "wifi": cmd_acs_wifi, "wan": cmd_acs_wan, "firmware": cmd_acs_firmware,
+                "reboot": cmd_acs_reboot, "refresh": cmd_acs_refresh,
+                "get": cmd_acs_get, "set": cmd_acs_set, "params": cmd_acs_params}
+    try:
+        handlers[args.acs_cmd](base, args)
+    except requests.exceptions.RequestException as e:
+        sys.exit("cannot reach the ACS at %s (%s)\nRun this on the ACS host, or pass --acs-url / set $TPWRCTL_ACS." % (base, e))
+    except RuntimeError as e:
+        sys.exit("error: %s" % e)
+
+
 # ----------------------------------------------------------------------------- telnet
 # The TL-WR850N also exposes a restricted proprietary CLI on telnet/23 (password-only).
 # It is NOT a Unix shell; it's a small command tree. Only one telnet session is allowed
@@ -909,6 +1186,22 @@ def main():
     ubl.add_argument("mac", help="MAC address to unblock")
     ubl.add_argument("--dry-run", action="store_true", help="show what would be removed")
     sub.add_parser("blocklist", help="show Access Control state + blocked devices").set_defaults(fn=cmd_blocklist)
+    acs = sub.add_parser("acs", help="manage the router remotely via TR-069 (GenieACS ACS)")
+    acs.add_argument("--acs-url", help="GenieACS NBI base URL (default http://localhost:7557 / $TPWRCTL_ACS)")
+    asub = acs.add_subparsers(dest="acs_cmd", required=True)
+    asub.add_parser("devices", help="list devices (CPEs) known to the ACS")
+    ast_ = asub.add_parser("status", help="one-screen overview over TR-069"); ast_.add_argument("--id")
+    acl = asub.add_parser("clients", help="connected LAN hosts over TR-069"); acl.add_argument("--id"); acl.add_argument("--online", action="store_true")
+    awf = asub.add_parser("wifi", help="show Wi-Fi, or change it (--ssid/--password/--radio)"); awf.add_argument("--id")
+    awf.add_argument("--ssid"); awf.add_argument("--password", dest="psk"); awf.add_argument("--radio", choices=["on", "off"])
+    awf.add_argument("--dry-run", action="store_true"); awf.add_argument("-y", "--yes", action="store_true")
+    awn = asub.add_parser("wan", help="WAN/Internet details over TR-069"); awn.add_argument("--id")
+    asub.add_parser("firmware", help="firmware/model over TR-069").add_argument("--id")
+    ap_ = asub.add_parser("params", help="dump the device's TR-069 parameters"); ap_.add_argument("--id")
+    ag = asub.add_parser("get", help="read a TR-069 parameter"); ag.add_argument("param"); ag.add_argument("--id")
+    aset = asub.add_parser("set", help="set a TR-069 parameter"); aset.add_argument("param"); aset.add_argument("value"); aset.add_argument("--id")
+    arb = asub.add_parser("reboot", help="reboot the router via TR-069"); arb.add_argument("--id"); arb.add_argument("-y", "--yes", action="store_true")
+    arf = asub.add_parser("refresh", help="refresh the device's parameters"); arf.add_argument("--id"); arf.add_argument("--object", default="")
     tn = sub.add_parser(
         "telnet",
         help="run a command in the router's telnet CLI",
@@ -938,6 +1231,8 @@ def main():
         return args.fn(None, args)
     if args.cmd == "oids":                       # reference only, no login needed
         print(WEB_OIDS); return
+    if args.cmd == "acs":                        # talks to the ACS, not the router web UI
+        return cmd_acs(args)
     if args.cmd == "telnet" and args.list and not args.commands:
         print(telnet_help()); return
     host, pw = resolve_creds(args)
