@@ -1,0 +1,15 @@
+#!/bin/sh
+# Portable launcher for tpwrctl.
+# Runs the tool with the bundled virtualenv if present, otherwise system python3.
+# Resolves its own location (even when invoked through a symlink on $PATH), so there
+# are no hardcoded paths.
+self=$0
+if command -v readlink >/dev/null 2>&1; then
+    real=$(readlink -f "$self" 2>/dev/null) && [ -n "$real" ] && self=$real
+fi
+dir=$(cd "$(dirname "$self")" && pwd)
+
+py="$dir/.venv/bin/python"
+[ -x "$py" ] || py=$(command -v python3)
+
+exec "$py" "$dir/tpwrctl.py" "$@"
