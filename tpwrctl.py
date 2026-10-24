@@ -452,6 +452,94 @@ def cmd_set(r, args):
     print("OK: set %s %s" % (args.oid, attrs))
 
 
+# --- Access Control: block/unblock devices by MAC (wired or wireless) --------------
+# Uses the router's Access Control feature: FIREWALL (enable + firewallMode=1 blacklist)
+# plus a paired INTERNAL_HOST (the device) and RULE (block action) per blocked MAC.
+_MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+
+
+def _fw_state(r):
+    return r.get("FIREWALL", ["enable", "firewallMode", "defaultAction"])
+
+
+def _ac_find(r, mac):
+    """Find the (host, rule) access-control entries for a MAC, or (None, None)."""
+    mac = _macnorm(mac)
+    host = next((h for h in r.getlist("INTERNAL_HOST") if _macnorm(h.get("mac")) == mac), None)
+    rule = None
+    if host:
+        name = host.get("entryName")
+        rule = next((x for x in r.getlist("RULE")
+                     if x.get("internalHostRef") == name and x.get("isParentCtrl") != "1"), None)
+    return host, rule
+
+
+def cmd_block(r, args):
+    mac = _macnorm(args.mac)
+    if not _MAC_RE.match(mac):
+        sys.exit("invalid MAC address: %s" % args.mac)
+    name = args.name or mac.replace(":", "")
+    host, rule = _ac_find(r, mac)
+    if host and rule:
+        print("already blocked: %s (%s)" % (mac, host.get("entryName"))); return
+    fw = _fw_state(r)
+    steps = []
+    if fw.get("enable") != "1" or fw.get("firewallMode") != "1":
+        steps.append("turn Access Control ON in blacklist mode")
+    steps.append("block %s (as '%s') -- it will be disconnected and can't reconnect" % (mac, name))
+    print("Plan:")
+    for s in steps:
+        print("  - " + s)
+    if args.dry_run:
+        print("(dry-run: nothing sent)"); return
+    if not args.yes and input("Apply? [y/N] ").strip().lower() != "y":
+        print("aborted."); return
+    r.set("FIREWALL", {"enable": "1"})
+    r.set("FIREWALL", {"firewallMode": "1"})          # 1 = blacklist (block listed)
+    r.cgi([{"action": ACT_ADD, "oid": "INTERNAL_HOST",
+            "attrs": {"type": "1", "entryName": name, "mac": mac}}])
+    r.cgi([{"action": ACT_ADD, "oid": "RULE",
+            "attrs": {"isParentCtrl": "0", "ruleName": name, "internalHostRef": name,
+                      "externalHostRef": "", "scheduleRef": "", "action": "0", "enable": "1"}}])
+    print("blocked %s" % mac)
+
+
+def cmd_unblock(r, args):
+    mac = _macnorm(args.mac)
+    host, rule = _ac_find(r, mac)
+    if not host and not rule:
+        print("not in the block list: %s" % mac); return
+    if args.dry_run:
+        print("(dry-run) would remove the block rule + host for %s" % mac); return
+    if rule:
+        r.cgi([{"action": ACT_DEL, "oid": "RULE", "stack": rule.get("__stack")}])
+    if host:
+        r.cgi([{"action": ACT_DEL, "oid": "INTERNAL_HOST", "stack": host.get("__stack")}])
+    print("unblocked %s" % mac)
+
+
+def cmd_blocklist(r, args):
+    fw = _fw_state(r)
+    mode = {"1": "blacklist (listed = blocked)", "0": "whitelist (only listed allowed)"}.get(
+        fw.get("firewallMode"), "?")
+    print("Access Control : %s   mode: %s" % ("ON" if fw.get("enable") == "1" else "OFF", mode))
+    verdict = "blocked" if fw.get("firewallMode") == "1" else "allowed"
+    hosts = {h.get("entryName"): h for h in r.getlist("INTERNAL_HOST")}
+    rows = []
+    for ru in r.getlist("RULE"):
+        if ru.get("isParentCtrl") == "1":
+            continue
+        h = hosts.get(ru.get("internalHostRef"))
+        if h:
+            rows.append((h.get("entryName", ""), _macnorm(h.get("mac"))))
+    if not rows:
+        print("  (no device rules)"); return
+    status = verdict if fw.get("enable") == "1" else verdict + " (AC off - not enforced)"
+    print("  %-18s %-17s %s" % ("NAME", "MAC", "STATUS"))
+    for n, m in rows:
+        print("  %-18s %-17s %s" % (n[:18], m, status))
+
+
 # ----------------------------------------------------------------------------- telnet
 # The TL-WR850N also exposes a restricted proprietary CLI on telnet/23 (password-only).
 # It is NOT a Unix shell; it's a small command tree. Only one telnet session is allowed
@@ -787,6 +875,17 @@ def main():
     st.set_defaults(fn=cmd_set); st.add_argument("oid"); st.add_argument("attrs", nargs="+")
     st.add_argument("--stack", help="object stack, e.g. 1,1,0,0,0,0 (for nested objects)")
     sub.add_parser("oids", help="list useful web-API objects (web counterpart of 'telnet --list')")
+    bl = sub.add_parser("block", help="block a device by MAC (Access Control blacklist)")
+    bl.set_defaults(fn=cmd_block)
+    bl.add_argument("mac", help="MAC address of the device to block")
+    bl.add_argument("--name", help="label for the entry (default: the MAC without colons)")
+    bl.add_argument("--dry-run", action="store_true", help="show the plan, send nothing")
+    bl.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    ubl = sub.add_parser("unblock", help="remove a device from the block list")
+    ubl.set_defaults(fn=cmd_unblock)
+    ubl.add_argument("mac", help="MAC address to unblock")
+    ubl.add_argument("--dry-run", action="store_true", help="show what would be removed")
+    sub.add_parser("blocklist", help="show Access Control state + blocked devices").set_defaults(fn=cmd_blocklist)
     tn = sub.add_parser(
         "telnet",
         help="run a command in the router's telnet CLI",

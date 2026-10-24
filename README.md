@@ -56,6 +56,9 @@ Credentials resolve from `--password` → `$ROUTER_PASS` → `~/.config/tpwrctl/
 | `oids` | 📖 Catalog of web-API objects you can `get`/`set` |
 | `get <OID> [attrs] [--gl] [--stack S] [--json]` | **General read** — any object, friendly or JSON |
 | `set <OID> attr=val ... [--stack S]` | **General write** — change any setting |
+| `blocklist` | Show Access Control state + blocked devices |
+| `block <MAC> [--name N] [--dry-run] [-y]` | **Block a device** by MAC (Access Control blacklist) |
+| `unblock <MAC> [--dry-run]` | Remove a device from the block list |
 | `config --password ...` | Save host + password (mode 600) |
 
 **Change Wi-Fi over the web** (the web-UI alternative to `telnet wlctl set`):
@@ -66,6 +69,15 @@ tpwrctl wifi --bandwidth 20M                                 # Auto | 20M | 40M
 tpwrctl wifi --radio off                                     # turn the radio off/on
 ```
 > ⚠️ Changing Wi-Fi restarts the radio — connected clients drop for a few seconds.
+
+**Kick / block unknown devices** (Access Control blacklist — works for wired *and* wireless):
+```bash
+tpwrctl devices --online            # find the unknown device's MAC
+tpwrctl block AA:BB:CC:DD:EE:FF      # block it (enables Access Control; asks to confirm)
+tpwrctl blocklist                    # see what's blocked
+tpwrctl unblock AA:BB:CC:DD:EE:FF    # let it back on
+```
+> Tip: if you don't know which clients are legit, rotating the Wi-Fi key (`tpwrctl wifi --password …`) boots everyone at once; blocking is the surgical option. Note that phones with MAC randomization can reappear under a new MAC.
 
 ### Over the telnet CLI (for the few settings only it exposes)
 | Command | What it does |
