@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Local, user-specific, or sensitive — never commit
+config.json
+*.local
+*.log
+*.pcap
