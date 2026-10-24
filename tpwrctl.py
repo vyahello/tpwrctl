@@ -12,7 +12,7 @@ reverse-engineered from the device's own JavaScript:
 
 No SSH exists on this model; this uses the always-on web UI (port 80).
 """
-import sys, os, re, json, time, argparse, hashlib, base64, socket, getpass
+import sys, os, re, json, time, argparse, hashlib, base64, socket, getpass, calendar, ipaddress
 
 try:
     import requests
@@ -150,6 +150,14 @@ def _macnorm(m):
     return (m or "").upper().replace("-", ":")
 
 
+def _confirm(prompt):
+    """y/N question; 'y' or 'yes' confirms, anything else (or no TTY) declines."""
+    try:
+        return input(prompt + " [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
 def _wifi_sec(ap):
     """Human-readable Wi-Fi security mode from a LAN_WLAN entry (uses beaconType)."""
     bt = ap.get("beaconType", "")
@@ -273,7 +281,7 @@ def _wifi_set(r, args, changes):
     if args.dry_run:
         print("(dry-run: nothing sent)")
         return
-    if not args.yes and input("Apply? [y/N] ").strip().lower() != "y":
+    if not args.yes and not _confirm("Apply?"):
         print("aborted.")
         return
     r.cgi([{"action": ACT_SET, "oid": "LAN_WLAN", "stack": stack, "attrs": changes}])
@@ -373,7 +381,7 @@ def cmd_cpu(r, args):
 
 def cmd_reboot(r, args):
     if not args.yes:
-        if input("Reboot the router now? Network drops for ~90s. [y/N] ").strip().lower() != "y":
+        if not _confirm("Reboot the router now? Network drops for ~90s."):
             print("aborted."); return
     r.op("ACT_REBOOT")
     print("Reboot command sent. The router will be back in ~90 seconds.")
@@ -540,7 +548,7 @@ def cmd_block(r, args):
         print("  - " + s)
     if args.dry_run:
         print("(dry-run: nothing sent)"); return
-    if not args.yes and input("Apply? [y/N] ").strip().lower() != "y":
+    if not args.yes and not _confirm("Apply?"):
         print("aborted."); return
     r.set("FIREWALL", {"enable": "1"})
     r.set("FIREWALL", {"firewallMode": "1"})          # 1 = blacklist (block listed)
@@ -591,6 +599,23 @@ def cmd_blocklist(r, args):
 # ----------------------------------------------------------------------------- ACS / TR-069
 # Manage the router through its TR-069 ACS (GenieACS). These commands talk to the GenieACS
 # NBI (REST API), default http://localhost:7557 -- run them on the ACS host (the Oracle VM).
+#
+# The router sits behind NAT, so the ACS can't reach it on demand: every task runs at the
+# router's next periodic inform. Writes wait for that and read the result back (--no-wait
+# only queues); reads show the ACS's cached values with their age (--refresh re-reads them).
+# TR-069 never reports secrets (the Wi-Fi key reads back empty), so a key set through
+# `acs wifi --password` is remembered locally in ACS_SECRETS.
+ACS_SECRETS = os.path.expanduser("~/.config/tpwrctl/acs-secrets.json")
+ACS_HELP = """Manage the router over TR-069 through the GenieACS ACS (run on the ACS host).
+
+The router is behind NAT, so the ACS can't reach it on demand: each task runs at the
+router's next periodic inform ('acs inform' shows when; 'acs inform --interval 60' makes
+control snappier). Writes wait for it and read the result back; --no-wait only queues.
+Reads show the ACS's cached values with their age; --refresh re-reads them first.
+TR-069 never reports secrets, so a Wi-Fi key set with 'acs wifi --password' is
+remembered in ~/.config/tpwrctl/acs-secrets.json and shown by 'acs wifi'."""
+
+
 def _acs_base(args):
     return (getattr(args, "acs_url", None) or os.environ.get("TPWRCTL_ACS")
             or load_conf().get("acs_url") or "http://localhost:7557")
@@ -601,35 +626,37 @@ def _q(s):
     return quote(s, safe="")
 
 
-def _acs_get(base, path):
-    r = requests.get(base.rstrip("/") + path, timeout=30)
+def _acs_req(base, method, path, timeout=30, **kw):
+    r = requests.request(method, base.rstrip("/") + path, timeout=timeout, **kw)
     if r.status_code >= 400:
-        raise RuntimeError("ACS GET %s -> HTTP %s" % (path, r.status_code))
-    return r.json()
+        raise RuntimeError("ACS %s %s -> HTTP %s %s" % (method, path.split("?")[0], r.status_code,
+                                                        r.text.strip()[:200]))
+    return r
 
 
-def _acs_device(base, did):
+def _acs_get(base, path):
+    return _acs_req(base, "GET", path).json()
+
+
+def _acs_find(base, coll, query):
+    return _acs_get(base, "/%s/?query=%s" % (coll, _q(json.dumps(query))))
+
+
+def _acs_device(base, did, projection=None):
     # GenieACS has no GET /devices/<id>; query by _id instead.
-    devs = _acs_get(base, "/devices/?query=" + _q(json.dumps({"_id": did})))
+    path = "/devices/?query=" + _q(json.dumps({"_id": did}))
+    if projection:
+        path += "&projection=" + _q(",".join(projection))
+    devs = _acs_get(base, path)
     if not devs:
         raise RuntimeError("device %s not found on the ACS" % did)
     return devs[0]
 
 
-def _acs_task(base, did, body):
-    """POST a task with a connection request; report whether it ran now or was queued."""
-    r = requests.post(base.rstrip("/") + "/devices/%s/tasks" % _q(did),
-                      params={"connection_request": ""}, data=json.dumps(body),
-                      headers={"Content-Type": "application/json"}, timeout=40)
-    if r.status_code >= 400:
-        raise RuntimeError("task %s -> HTTP %s %s" % (body.get("name"), r.status_code, r.text[:200]))
-    return "applied now" if r.status_code == 200 else "queued (runs on the next inform, <=5 min)"
-
-
 def _acs_pick(base, explicit):
     if explicit:
         return explicit
-    devs = _acs_get(base, "/devices/")
+    devs = _acs_get(base, "/devices/?projection=_id")
     if not devs:
         raise RuntimeError("the ACS knows no devices yet - has the router informed? (set its ACS URL)")
     if len(devs) > 1:
@@ -657,6 +684,17 @@ def _nval(node):
     return node.get("_value") if isinstance(node, dict) and "_value" in node else None
 
 
+def _leaves(node, pfx):
+    """(path, node) for every parameter under node (node itself if it is one)."""
+    if isinstance(node, dict):
+        if "_value" in node:
+            yield pfx, node
+            return
+        for k, v in node.items():
+            if not k.startswith("_"):
+                yield from _leaves(v, (pfx + "." + k) if pfx else k)
+
+
 def _rows(dev, path):
     """Numbered table instances under path, as (index, subtree), in numeric order."""
     node = _node(dev, path) or {}
@@ -682,6 +720,220 @@ def _root(dev):  # data model root differs by device
     return "InternetGatewayDevice" if "InternetGatewayDevice" in dev else "Device"
 
 
+def _full(dev, path):
+    """Accept paths with or without the data-model root: DeviceInfo.UpTime works too."""
+    return path if path.split(".")[0] in ("InternetGatewayDevice", "Device") else _root(dev) + "." + path
+
+
+def _epoch(ts):
+    """GenieACS timestamp (ISO 8601, UTC) -> epoch seconds, or None."""
+    try:
+        return calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _utc(ts):
+    """'HH:MM:SS UTC' for today's timestamps, else 'YYYY-MM-DD HH:MM:SS UTC'."""
+    if not ts:
+        return "never"
+    return "%s UTC" % (ts[11:19] if ts[:10] == time.strftime("%Y-%m-%d", time.gmtime()) else ts[:19].replace("T", " "))
+
+
+def _ago(ts):
+    e = _epoch(ts)
+    if e is None:
+        return "?"
+    s = max(0, int(time.time() - e))
+    return "%ds ago" % s if s < 120 else "%dm ago" % (s // 60) if s < 7200 else "%s ago" % _hms(s)
+
+
+def _asof(node):
+    """'[read HH:MM:SS UTC, 5m ago]' for a cached parameter or object."""
+    ts = node.get("_timestamp") if isinstance(node, dict) else None
+    return "[read %s, %s]" % (_utc(ts), _ago(ts)) if ts else "[never read]"
+
+
+def _uptime(dev, path, boot_fallback=True):
+    """A cached uptime counter extrapolated to now: (seconds, approximate) or None.
+    TR-069 values are snapshots; if the router booted since, estimate from the BOOT inform."""
+    n = _node(dev, path)
+    v, e = _nval(n), _epoch((n or {}).get("_timestamp"))
+    boot, bstrap = _epoch(dev.get("_lastBoot")), _epoch(dev.get("_lastBootstrap"))
+    if v is not None and e is not None and (boot or 0) <= e and (bstrap or 0) <= e:
+        return int(v) + int(time.time() - e), False
+    if boot_fallback and boot and boot >= (bstrap or 0):
+        return int(time.time() - boot), True
+    return None
+
+
+def _fmt_up(u):
+    return "?  (rebooted since it was read - use --refresh)" if u is None else ("~" if u[1] else "") + _hms(u[0])
+
+
+def _inform_interval(dev):
+    ms = _root(dev) + ".ManagementServer"
+    try:
+        return int(_param(dev, ms + ".PeriodicInformInterval")) if _truthy(
+            _param(dev, ms + ".PeriodicInformEnable")) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _next_inform(dev):
+    """Seconds until the router's next periodic inform is due (<= 0: overdue), or None."""
+    iv, last = _inform_interval(dev), _epoch(dev.get("_lastInform"))
+    return None if iv is None or last is None else last + iv - time.time()
+
+
+def _progress(msg):
+    """One live status line on a TTY; _progress('') clears it."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[K" + msg)
+        sys.stdout.flush()
+
+
+# --- tasks: queue, wait for the router to run them, report faults --------------------------
+def _acs_post(base, did, body, connreq=True):
+    """Queue a task (optionally with a connection request); returns (task, ran_now)."""
+    r = _acs_req(base, "POST", "/devices/%s/tasks%s" % (_q(did), "?connection_request&timeout=3000"
+                                                        if connreq else ""),
+                 data=json.dumps(body), headers={"Content-Type": "application/json"}, timeout=60)
+    return r.json(), r.status_code == 200
+
+
+def _fault_text(f):
+    d = f.get("detail") or {}
+    sub = "; ".join("%s: %s %s" % (x.get("parameterName"), x.get("faultCode"), x.get("faultString"))
+                    for x in d.get("setParameterValuesFault") or [] if isinstance(x, dict))
+    return "%s %s%s" % (f.get("code"), f.get("message"), " (%s)" % sub if sub else "")
+
+
+def _acs_run(base, did, bodies, what, wait=True):
+    """Queue tasks (they run in order, in one session) and wait until the router has run them.
+    Returns the tasks once done, or None if only queued. A faulted task is deleted together
+    with its fault (and the rest of the batch), so GenieACS doesn't retry it forever."""
+    tasks, now = [], True
+    for i, b in enumerate(bodies):
+        t, ran = _acs_post(base, did, b, connreq=(i == len(bodies) - 1))
+        tasks.append(t)
+        now = now and ran
+    if now:
+        return tasks
+    dev = _acs_device(base, did)
+    nxt = _next_inform(dev)
+    if not wait:
+        print("%s: queued - runs at the router's next inform%s ('acs tasks' to see/cancel)"
+              % (what, " (due in %ds)" % nxt if nxt and nxt > 0 else ""))
+        return None
+    iv = _inform_interval(dev) or 300
+    due = time.time() + (nxt if nxt is not None else iv)
+    deadline = max(due, time.time()) + iv + 60              # tolerate one missed inform
+    pend, said = {t["_id"]: t for t in tasks}, False
+    try:
+        while pend:
+            for tid in list(pend):
+                flt = _acs_find(base, "faults", {"_id": "%s:task_%s" % (did, tid)})
+                if flt:
+                    for other in pend:
+                        _acs_req(base, "DELETE", "/tasks/" + other)
+                    _acs_req(base, "DELETE", "/faults/" + _q(flt[0]["_id"]))
+                    raise RuntimeError("%s: the router rejected %s: %s"
+                                       % (what, pend[tid].get("name"), _fault_text(flt[0])))
+                if not _acs_find(base, "tasks", {"_id": tid}):
+                    del pend[tid]
+            if not pend:
+                break
+            left = int(due - time.time())
+            if time.time() > deadline:
+                raise RuntimeError("%s: the router hasn't informed since %s; the task is still queued "
+                                   "('acs tasks' to see/cancel)" % (what, _utc(dev.get("_lastInform"))))
+            msg = "%s: waiting for the router's next inform (%s)" % (
+                what, "due in %ds" % left if left > 0 else "overdue %ds" % -left)
+            if sys.stdout.isatty():
+                _progress(msg + " ... Ctrl-C leaves it queued")
+            elif not said:
+                print(msg + " ...", flush=True)
+                said = True
+            time.sleep(2)
+    finally:
+        _progress("")
+    return tasks
+
+
+def _acs_refresh(base, did, objects, what, wait=True):
+    return _acs_run(base, did, [{"name": "refreshObject", "objectName": o} for o in objects], what, wait)
+
+
+_BOOLS = {"true": True, "1": True, "on": True, "yes": True,
+          "false": False, "0": False, "off": False, "no": False}
+
+
+def _coerce(val, typ):
+    """CLI value -> JSON value of a TR-069 type (ValueError if it doesn't fit)."""
+    if typ == "xsd:boolean":
+        if isinstance(val, bool):
+            return val
+        if str(val).lower() not in _BOOLS:
+            raise ValueError("expected true/false, got %r" % val)
+        return _BOOLS[str(val).lower()]
+    if typ in ("xsd:int", "xsd:long", "xsd:unsignedInt", "xsd:unsignedLong"):
+        try:
+            n = int(val)
+        except ValueError:
+            raise ValueError("expected an integer, got %r" % val)
+        if typ.startswith("xsd:unsigned") and n < 0:
+            raise ValueError("expected a non-negative integer")
+        return n
+    return str(val)
+
+
+def _acs_set(base, did, changes, what, wait=True, secret=(), label=None):
+    """SetParameterValues, plus a GetParameterValues of the same names in the same session so
+    the result is what the router reads back. changes: [(path, value, type)].
+    Returns True/False (all applied / some didn't), or None if only queued."""
+    label = label or (lambda p: p.partition(".")[2])
+    bodies = [{"name": "setParameterValues", "parameterValues": [[p, v, t] for p, v, t in changes]}]
+    readable = [p for p, _, _ in changes if p not in secret]
+    if readable:
+        bodies.append({"name": "getParameterValues", "parameterNames": readable})
+    if _acs_run(base, did, bodies, what, wait) is None:
+        return None
+    after, ok = _acs_device(base, did), True
+    for p, v, _ in changes:
+        if p in secret:
+            print("  %-30s accepted (write-only: the router never reads it back)" % label(p))
+            continue
+        got = _param(after, p)
+        same = str(got).lower() == str(v).lower()
+        ok = ok and same
+        print("  %-30s = %s%s" % (label(p), got, "  OK" if same else "   <- asked for %s" % v))
+    return ok
+
+
+# --- remembered secrets (TR-069 never reads them back) --------------------------------------
+def _secrets(did):
+    try:
+        with open(ACS_SECRETS) as f:
+            return json.load(f).get(did, {})
+    except Exception:
+        return {}
+
+
+def _remember(did, **kv):
+    try:
+        with open(ACS_SECRETS) as f:
+            s = json.load(f)
+    except Exception:
+        s = {}
+    s.setdefault(did, {}).update(kv)
+    os.makedirs(os.path.dirname(ACS_SECRETS), exist_ok=True)
+    fd = os.open(ACS_SECRETS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(s, f, indent=1)
+    os.chmod(ACS_SECRETS, 0o600)
+
+
 def _acs_wifi_sec(w):
     """Human-readable Wi-Fi security from a WLANConfiguration subtree."""
     bt = _nval(w.get("BeaconType")) or ""
@@ -690,7 +942,7 @@ def _acs_wifi_sec(w):
     psk = "PSKAuthentication" in (_nval(w.get("IEEE11iAuthenticationMode")) or "",
                                   _nval(w.get("WPAAuthenticationMode")) or "")
     kind = "PSK" if psk else "Enterprise"
-    if bt == "Basic":
+    if bt in ("Basic", "None"):
         return "Open" if _nval(w.get("BasicEncryptionModes")) == "None" else "WEP"
     if "11i" in bt and "WPA" in bt:
         return "WPA/WPA2-%s (%s)" % (kind, cipher)
@@ -711,165 +963,397 @@ def _p_wan(root):
 
 
 def _p_hosts(root):
-    return root + ".LANDevice.1.Hosts.Host"
+    return root + ".LANDevice.1.Hosts"
 
 
+def _check_ssid(s):
+    if 1 <= len(s.encode()) <= 32:
+        return s
+    raise argparse.ArgumentTypeError("an SSID is 1-32 bytes")
+
+
+def _check_psk(k):
+    if re.fullmatch(r"[0-9A-Fa-f]{64}", k) or (8 <= len(k) <= 63 and all(32 <= ord(c) < 127 for c in k)):
+        return k
+    raise argparse.ArgumentTypeError("a WPA key is 8-63 printable ASCII characters (or 64 hex digits)")
+
+
+def _check_channel(c):
+    if c.lower() == "auto":
+        return "auto"
+    if c.isdigit() and 1 <= int(c) <= 13:
+        return int(c)
+    raise argparse.ArgumentTypeError("channel is 'auto' or 1-13")
+
+
+# --- commands ---------------------------------------------------------------------------------
 def cmd_acs_devices(base, args):
     devs = _acs_get(base, "/devices/")
     if not devs:
         print("no devices registered yet (waiting for the router to inform the ACS)"); return
-    print("%-34s %-12s %-21s %s" % ("ID", "MODEL", "LAST INFORM (UTC)", "FIRMWARE"))
+    print("%-26s %-11s %-24s %s" % ("ID", "MODEL", "LAST INFORM", "STATE"))
     for d in devs:
-        root = _root(d)
-        print("%-34s %-12s %-21s %s" % (
-            d.get("_id", "?"),
-            _param(d, root + ".DeviceInfo.ModelName") or "?",
-            (d.get("_lastInform", "?") or "?")[:19],
-            _param(d, root + ".DeviceInfo.SoftwareVersion") or "?"))
-
-
-def cmd_acs_reboot(base, args):
-    did = _acs_pick(base, args.id)
-    if not args.yes and input("Reboot %s via TR-069? [y/N] " % did).strip().lower() != "y":
-        print("aborted."); return
-    print("reboot: " + _acs_task(base, did, {"name": "reboot"}))
-
-
-def cmd_acs_refresh(base, args):
-    did = _acs_pick(base, args.id)
-    print("refresh: " + _acs_task(base, did, {"name": "refreshObject", "objectName": args.object}))
-
-
-def cmd_acs_get(base, args):
-    did = _acs_pick(base, args.id)
-    status = _acs_task(base, did, {"name": "getParameterValues", "parameterNames": [args.param]})
-    val = _param(_acs_device(base, did), args.param)
-    print("%s = %s   [refresh %s]" % (args.param, val, status))
-
-
-def cmd_acs_set(base, args):
-    did = _acs_pick(base, args.id)
-    body = {"name": "setParameterValues", "parameterValues": [[args.param, args.value]]}
-    print("set %s = %s : %s" % (args.param, args.value, _acs_task(base, did, body)))
-
-
-def cmd_acs_params(base, args):
-    dev = _acs_device(base, _acs_pick(base, args.id))
-    def walk(o, pfx=""):
-        if isinstance(o, dict):
-            if "_value" in o:
-                print("  %s = %s" % (pfx, o["_value"])); return
-            for k, v in o.items():
-                if not k.startswith("_"):
-                    walk(v, (pfx + "." + k) if pfx else k)
-    walk(dev)
-
-
-def _inform(dev):
-    return (dev.get("_lastInform", "?") or "?")[:19]
-
-
-def _read_at(dev, node):
-    """When the ACS last read a cached parameter (it can be far older than the last inform)."""
-    ts = node.get("_timestamp") if isinstance(node, dict) else None
-    return ts[:19] if ts else _inform(dev)
+        root, iv, last = _root(d), _inform_interval(d) or 300, _epoch(d.get("_lastInform"))
+        alive = last is not None and time.time() - last < 2 * iv + 60
+        print("%-26s %-11s %-24s %s" % (
+            d.get("_id", "?"), _param(d, root + ".DeviceInfo.ModelName") or "?",
+            "%s (%s)" % (_utc(d.get("_lastInform")), _ago(d.get("_lastInform"))),
+            "online (informs every %ds)" % iv if alive else "SILENT - no inform for %s" % _ago(
+                d.get("_lastInform"))[:-4]))
 
 
 def cmd_acs_status(base, args):
-    dev = _acs_device(base, _acs_pick(base, args.id))
-    root = _root(dev); di = root + ".DeviceInfo"
-    wan = _p_wan(root); w = _node(dev, _p_wlan(root)) or {}
-    hosts = _rows(dev, _p_hosts(root))
+    did = _acs_pick(base, args.id)
+    dev = _acs_device(base, did)
+    root = _root(dev)
+    if args.refresh:
+        _acs_refresh(base, did, [root + ".DeviceInfo", _p_wan(root), _p_wlan(root), _p_hosts(root)], "refresh")
+        dev = _acs_device(base, did)
+    di, wan = root + ".DeviceInfo", _p_wan(root)
+    w = _node(dev, _p_wlan(root)) or {}
+    hosts = _rows(dev, _p_hosts(root) + ".Host")
     active = sum(1 for _, h in hosts if _truthy(_nval(h.get("Active"))))
+    sw = _param(dev, di + ".SoftwareVersion")
+    nxt = _next_inform(dev)
     print("Model       : %s  (hw %s)" % (_param(dev, di + ".ModelName"), _param(dev, di + ".HardwareVersion")))
-    print("Firmware    : %s" % _param(dev, di + ".SoftwareVersion"))
-    print("Uptime      : %s" % _hms(_param(dev, di + ".UpTime")))
-    print("WAN         : %s   IP %s" % (_param(dev, wan + ".ConnectionStatus"), _param(dev, wan + ".ExternalIPAddress")))
-    print("Wi-Fi       : %s  (%s, ch %s, %s)  [read %s UTC]" % (
+    print("Firmware    : %s   [built %s]" % (sw, _fw_date(sw)))
+    print("Uptime      : %s" % _fmt_up(_uptime(dev, di + ".UpTime")))
+    print("WAN         : %s   IP %s   %s" % (_param(dev, wan + ".ConnectionStatus"),
+                                            _param(dev, wan + ".ExternalIPAddress"),
+                                            _asof(_node(dev, wan + ".ConnectionStatus"))))
+    print("Wi-Fi       : %s  (%s, ch %s, %s)   %s" % (
         _nval(w.get("SSID")), "on" if _truthy(_nval(w.get("Enable"))) else "off",
-        _nval(w.get("Channel")), _acs_wifi_sec(w), _read_at(dev, w.get("Enable"))))
-    print("Clients     : %d active  (%d known)" % (active, len(hosts)))
-    print("Last inform : %s UTC" % _inform(dev))
+        _nval(w.get("Channel")), _acs_wifi_sec(w), _asof(w.get("Enable"))))
+    print("Clients     : %d active  (%d known)   %s" % (
+        active, len(hosts), _asof(_node(dev, _p_hosts(root) + ".HostNumberOfEntries"))))
+    print("Last inform : %s (%s)%s" % (_utc(dev.get("_lastInform")), _ago(dev.get("_lastInform")),
+                                       "; next due in %ds" % nxt if nxt and nxt > 0 else ""))
 
 
 def cmd_acs_clients(base, args):
-    dev = _acs_device(base, _acs_pick(base, args.id))
-    hosts = _rows(dev, _p_hosts(_root(dev)))
-    active_total = sum(1 for _, h in hosts if _truthy(_nval(h.get("Active"))))
+    did = _acs_pick(base, args.id)
+    dev = _acs_device(base, did)
+    if args.refresh:
+        _acs_refresh(base, did, [_p_hosts(_root(dev))], "refresh")
+        dev = _acs_device(base, did)
+    hp = _p_hosts(_root(dev))
+    hosts = _rows(dev, hp + ".Host")
     rows = []
     for _, h in hosts:
         act = _truthy(_nval(h.get("Active")))
         if args.online and not act:
             continue
+        lt = _nval(h.get("LeaseTimeRemaining"))
+        dt = time.time() - (_epoch((h.get("LeaseTimeRemaining") or {}).get("_timestamp")) or time.time())
+        left = "-" if lt in (None, "", -1) or int(lt) < 0 else _hms(max(0, int(lt) - int(dt)))
         rows.append((_nval(h.get("HostName")) or "Unknown", _nval(h.get("IPAddress")) or "",
-                     _macnorm(_nval(h.get("MACAddress"))), _nval(h.get("AddressSource")) or "", act))
-    print("%-24s %-15s %-17s %-6s %s" % ("NAME", "IP", "MAC", "SRC", "STATE"))
-    for n, ip, mac, src, act in sorted(rows, key=lambda r: not r[4]):
-        print("%-24s %-15s %-17s %-6s %s" % (n[:24], ip, mac, src, "online" if act else "offline"))
-    print("\n%d active / %d known  [last inform %s UTC]" % (active_total, len(hosts), _inform(dev)))
+                     _macnorm(_nval(h.get("MACAddress"))), _nval(h.get("AddressSource")) or "", left, act))
+    print("%-24s %-15s %-17s %-7s %-11s %s" % ("NAME", "IP", "MAC", "SRC", "LEASE LEFT", "STATE"))
+    for n, ip, mac, src, left, act in sorted(rows, key=lambda r: not r[5]):
+        print("%-24s %-15s %-17s %-7s %-11s %s" % (n[:24], ip, mac, src, left, "online" if act else "offline"))
+    print("\n%d active / %d known   %s" % (sum(1 for _, h in hosts if _truthy(_nval(h.get("Active")))),
+                                         len(hosts), _asof(_node(dev, hp + ".HostNumberOfEntries"))))
 
 
 def cmd_acs_wifi(base, args):
     did = _acs_pick(base, args.id)
-    dev = _acs_device(base, did); wl = _p_wlan(_root(dev))
-    changes = {}
+    dev = _acs_device(base, did)
+    wl = _p_wlan(_root(dev))
+    w = _node(dev, wl) or {}
+    changes, secret = [], []
     if args.ssid is not None:
-        changes[wl + ".SSID"] = args.ssid
+        changes.append((wl + ".SSID", args.ssid, "xsd:string"))
     if args.psk is not None:
-        changes[wl + ".X_TP_PreSharedKey"] = args.psk
+        if (_nval(w.get("BeaconType")) or "Basic") in ("Basic", "None"):    # open network -> WPA2-PSK AES
+            changes += [(wl + ".BeaconType", "11i", "xsd:string"),
+                        (wl + ".IEEE11iAuthenticationMode", "PSKAuthentication", "xsd:string"),
+                        (wl + ".IEEE11iEncryptionModes", "AESEncryption", "xsd:string")]
+        changes.append((wl + ".X_TP_PreSharedKey", args.psk, "xsd:string"))
+        secret.append(wl + ".X_TP_PreSharedKey")
+    if args.channel is not None:
+        changes += ([(wl + ".AutoChannelEnable", True, "xsd:boolean")] if args.channel == "auto" else
+                    [(wl + ".AutoChannelEnable", False, "xsd:boolean"),
+                     (wl + ".Channel", args.channel, "xsd:unsignedInt")])
+    if args.bandwidth is not None:
+        changes.append((wl + ".X_TP_Bandwidth", args.bandwidth, "xsd:string"))
     if args.radio is not None:
-        changes[wl + ".Enable"] = (args.radio == "on")
+        changes.append((wl + ".Enable", args.radio == "on", "xsd:boolean"))
+    short = lambda p: p[len(wl) + 1:]
     if changes:
-        print("Wi-Fi changes (via TR-069):")
-        for k, v in changes.items():
-            print("  %s = %s" % (k.split(".WLANConfiguration.1.")[-1], v))
+        print("Wi-Fi changes on '%s' via TR-069:" % _nval(w.get("SSID")))
+        for p, v, _ in changes:
+            print("  %-26s %s -> %s" % (short(p), "(write-only)" if p in secret else _nval(_node(dev, p)), v))
+        print("! The radio restarts; Wi-Fi clients briefly disconnect.")
         if args.dry_run:
             print("(dry-run: nothing sent)"); return
-        if not args.yes and input("Apply? [y/N] ").strip().lower() != "y":
+        if not args.yes and not _confirm("Apply?"):
             print("aborted."); return
-        body = {"name": "setParameterValues", "parameterValues": [[k, v] for k, v in changes.items()]}
-        print("set: " + _acs_task(base, did, body)); return
-    w = _node(dev, wl) or {}
+        ok = _acs_set(base, did, changes, "wifi", wait=not args.no_wait, secret=secret, label=short)
+        if ok is None:
+            if args.psk is not None:
+                print("(the key is remembered only once the router confirms it - run without --no-wait)")
+            return
+        if args.psk is not None:
+            _remember(did, wifi_psk=args.psk, wifi_psk_set=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      wifi_ssid=args.ssid or _nval(w.get("SSID")))
+        if not ok:
+            sys.exit("error: the router didn't apply every change (see above)")
+        print("wifi: applied")
+        return
+    if args.refresh:
+        _acs_refresh(base, did, [wl], "refresh")
+        dev = _acs_device(base, did)
+        w = _node(dev, wl) or {}
+    # A refresh reads the key back empty; right after a set, GenieACS caches what it sent.
+    sec = _secrets(did)
+    key = _nval(w.get("X_TP_PreSharedKey")) or sec.get("wifi_psk")
+    if key:
+        pw = "%s   (as last set through the ACS%s; TR-069 never reads the key back)" % (
+            key, " " + _utc(sec.get("wifi_psk_set")) if sec.get("wifi_psk") == key else "")
+    else:
+        pw = "unknown - TR-069 never reads the key back; set it once with 'acs wifi --password' to remember it"
     print("SSID       : %s" % _nval(w.get("SSID")))
-    print("Status     : %s" % ("on" if _truthy(_nval(w.get("Enable"))) else "off"))
-    print("Channel    : %s" % _nval(w.get("Channel")))
-    print("Band / BW  : %s / %s" % (_nval(w.get("X_TP_Band")), _nval(w.get("X_TP_Bandwidth"))))
+    print("Radio      : %s  (status %s)" % ("on" if _truthy(_nval(w.get("Enable"))) else "off", _nval(w.get("Status"))))
+    print("Channel    : %s%s" % (_nval(w.get("Channel")), " (auto)" if _truthy(_nval(w.get("AutoChannelEnable"))) else ""))
+    print("Band / BW  : %s / %s, 802.11%s" % (_nval(w.get("X_TP_Band")), _nval(w.get("X_TP_Bandwidth")),
+                                             _nval(w.get("Standard"))))
+    print("Broadcast  : %s" % ("yes" if _truthy(_nval(w.get("SSIDAdvertisementEnabled"))) else "no (hidden SSID)"))
     print("Security   : %s" % _acs_wifi_sec(w))
-    key = _nval(w.get("X_TP_PreSharedKey"))
-    print("Password   : %s" % (key if key else "(write-only over TR-069 - read with local 'tpwrctl wifi')"))
-    print("[cached: read %s UTC, last inform %s UTC; 'acs refresh' to update]"
-          % (_read_at(dev, w.get("SSID")), _inform(dev)))
+    print("Password   : %s" % pw)
+    print("%s  ('--refresh' to re-read)" % _asof(w.get("SSID")))
 
 
 def cmd_acs_wan(base, args):
-    dev = _acs_device(base, _acs_pick(base, args.id)); wan = _p_wan(_root(dev))
-    for label, p in [("Status", "ConnectionStatus"), ("External IP", "ExternalIPAddress"),
-                     ("Gateway", "DefaultGateway"), ("DNS", "DNSServers"),
-                     ("MAC", "MACAddress"), ("Uptime", "Uptime")]:
-        v = _param(dev, wan + "." + p)
-        print("%-12s: %s" % (label, _hms(v) if p == "Uptime" else v))
+    did = _acs_pick(base, args.id)
+    dev = _acs_device(base, did)
+    if args.refresh:
+        _acs_refresh(base, did, [_p_wan(_root(dev))], "refresh")
+        dev = _acs_device(base, did)
+    wan = _p_wan(_root(dev))
+    for label, p in [("Status", "ConnectionStatus"), ("Type", "ConnectionType"),
+                     ("Addressing", "AddressingType"), ("External IP", "ExternalIPAddress"),
+                     ("Subnet mask", "SubnetMask"), ("Gateway", "DefaultGateway"), ("DNS", "DNSServers"),
+                     ("MAC", "MACAddress"), ("NAT", "NATEnabled")]:
+        print("%-12s: %s" % (label, _param(dev, wan + "." + p)))
+    up = _param(dev, wan + ".Uptime")      # this firmware always reports 0 here
+    print("%-12s: %s" % ("Uptime", _fmt_up(_uptime(dev, wan + ".Uptime", boot_fallback=False))
+                         if up else "not reported by the router"))
+    print(_asof(_node(dev, wan + ".ConnectionStatus")))
 
 
 def cmd_acs_firmware(base, args):
-    dev = _acs_device(base, _acs_pick(base, args.id)); di = _root(dev) + ".DeviceInfo"
+    did = _acs_pick(base, args.id)
+    dev = _acs_device(base, did)
+    di = _root(dev) + ".DeviceInfo"
+    if args.refresh:
+        _acs_refresh(base, did, [di], "refresh")
+        dev = _acs_device(base, did)
+    sw = _param(dev, di + ".SoftwareVersion")
     print("Model    : %s" % _param(dev, di + ".ModelName"))
     print("Hardware : %s" % _param(dev, di + ".HardwareVersion"))
-    print("Firmware : %s" % _param(dev, di + ".SoftwareVersion"))
-    print("Uptime   : %s" % _hms(_param(dev, di + ".UpTime")))
+    print("Firmware : %s" % sw)
+    print("Built    : %s" % _fw_date(sw))
+    print("Serial   : %s" % _param(dev, di + ".SerialNumber"))
+    print("Uptime   : %s" % _fmt_up(_uptime(dev, di + ".UpTime")))
+
+
+def cmd_acs_reboot(base, args):
+    did = _acs_pick(base, args.id)
+    if not args.yes and not _confirm("Reboot %s via TR-069? Internet drops for ~1 min." % did):
+        print("aborted."); return
+    before = _acs_device(base, did, ["_lastBoot"]).get("_lastBoot") or ""
+    if _acs_run(base, did, [{"name": "reboot"}], "reboot", wait=not args.no_wait) is None:
+        return
+    sent = time.time()
+    print("reboot: the router accepted the command; waiting for it to come back ...", flush=True)
+    try:
+        while time.time() - sent < 300:
+            boot = _acs_device(base, did, ["_lastBoot"]).get("_lastBoot") or ""
+            if boot > before:
+                print("reboot: done - the router was back online after %ds (BOOT inform %s)"
+                      % (max(0, (_epoch(boot) or time.time()) - sent), _utc(boot)))
+                return
+            _progress("reboot: restarting ... %ds" % (time.time() - sent))
+            time.sleep(3)
+    finally:
+        _progress("")
+    raise RuntimeError("the router hasn't reported back 5 min after the reboot - check its power/WAN")
+
+
+def cmd_acs_refresh(base, args):
+    did = _acs_pick(base, args.id)
+    dev = _acs_device(base, did)
+    obj = _full(dev, args.object).rstrip(".") if args.object else ""
+    tasks = _acs_refresh(base, did, [obj], "refresh", wait=not args.no_wait)
+    if tasks is None:
+        return
+    t0 = (_epoch(tasks[0].get("timestamp")) or time.time()) - 1
+    dev = _acs_device(base, did)
+    fresh = [p for p, n in _leaves(_node(dev, obj) if obj else dev, obj) if (_epoch(n.get("_timestamp")) or 0) >= t0]
+    print("refresh: %d parameters re-read from the router (%s)" % (len(fresh), obj or "whole tree"))
+
+
+def cmd_acs_get(base, args):
+    did = _acs_pick(base, args.id)
+    dev = _acs_device(base, did)
+    path = _full(dev, args.param).rstrip(".")
+    node = _node(dev, path)
+    if node is None and not args.force:
+        raise RuntimeError("the ACS doesn't know %s ('acs params --grep ...' to search; --force to ask "
+                           "the router anyway)" % path)
+    is_param = node is None or "_value" in node
+    if not args.cached:
+        body = ({"name": "getParameterValues", "parameterNames": [path]} if is_param
+                else {"name": "refreshObject", "objectName": path})
+        if _acs_run(base, did, [body], "get", wait=not args.no_wait) is not None:
+            dev = _acs_device(base, did)
+            node = _node(dev, path)
+    if node is None:
+        raise RuntimeError("the router has no parameter or object %s" % path)
+    leaves = list(_leaves(node, path))
+    if not leaves:
+        print("%s: no value" % path); return
+    if is_param and len(leaves) == 1:
+        p, n = leaves[0]
+        print("%s = %s   (%s, %s)" % (p, n.get("_value"), n.get("_type"), _asof(n)[1:-1]))
+        return
+    for p, n in leaves:
+        print("  %s = %s" % (p, n.get("_value")))
+    print("%d parameters  %s" % (len(leaves), _asof(node)))
+
+
+def cmd_acs_set(base, args):
+    did = _acs_pick(base, args.id)
+    dev = _acs_device(base, did)
+    path = _full(dev, args.param)
+    node = _node(dev, path)
+    if not args.force:
+        if not isinstance(node, dict) or "_value" not in node:
+            raise RuntimeError("the ACS doesn't know a parameter %s ('acs params --grep ...' to search; "
+                               "--force to send anyway)" % path)
+        if node.get("_writable") is False:
+            raise RuntimeError("%s is read-only on the router" % path)
+    typ = args.type or (node or {}).get("_type") or "xsd:string"
+    try:
+        val = _coerce(args.value, typ)
+    except ValueError as e:
+        raise RuntimeError("%s is %s: %s" % (path, typ, e))
+    print("%s: %s -> %s   (%s)" % (path, _nval(node), val, typ))
+    if (node or {}).get("_writable") is False:
+        print("! %s is read-only: GenieACS won't send this write (the read-back shows the real value)" % path)
+    if re.search(r"ManagementServer\.(URL|EnableCWMP|PeriodicInformEnable)$", path) and not args.yes:
+        print("! This can cut the router off from this ACS.")
+        if not _confirm("Send it?"):
+            print("aborted."); return
+    if args.dry_run:
+        print("(dry-run: nothing sent)"); return
+    ok = _acs_set(base, did, [(path, val, typ)], "set", wait=not args.no_wait)
+    if ok is False:
+        sys.exit("error: the router reads back a different value")
+
+
+def cmd_acs_params(base, args):
+    dev = _acs_device(base, _acs_pick(base, args.id))
+    pfx = _full(dev, args.prefix).rstrip(".") if args.prefix else ""
+    node = _node(dev, pfx) if pfx else dev
+    if node is None:
+        raise RuntimeError("the ACS has nothing under %s" % pfx)
+    rx = re.compile(args.grep, re.I) if args.grep else None
+    n = 0
+    for p, nd in _leaves(node, pfx):
+        if rx and not rx.search(p):
+            continue
+        n += 1
+        if args.long:
+            print("  %-78s %-24s %-15s %s %s" % (p, str(nd.get("_value"))[:24], nd.get("_type"),
+                                                 "rw" if nd.get("_writable") else "ro", _ago(nd.get("_timestamp"))))
+        else:
+            print("  %s = %s" % (p, nd.get("_value")))
+    print("%d parameters" % n)
+
+
+def cmd_acs_inform(base, args):
+    did = _acs_pick(base, args.id)
+    dev = _acs_device(base, did)
+    ms = _root(dev) + ".ManagementServer"
+    if args.interval is not None:
+        if not 30 <= args.interval <= 86400:
+            raise RuntimeError("the inform interval must be 30-86400 s")
+        print("PeriodicInformInterval: %s -> %d s" % (_param(dev, ms + ".PeriodicInformInterval"), args.interval))
+        ok = _acs_set(base, did, [(ms + ".PeriodicInformInterval", args.interval, "xsd:unsignedInt")],
+                      "inform", wait=not args.no_wait)
+        if ok is False:
+            sys.exit("error: the router reads back a different interval")
+        return
+    iv, nxt = _inform_interval(dev), _next_inform(dev)
+    url = _param(dev, ms + ".ConnectionRequestURL") or ""
+    host = re.sub(r"^\w+://", "", url).split("/")[0].split(":")[0]
+    try:
+        private = ipaddress.ip_address(host).is_private
+    except ValueError:
+        private = False
+    print("Periodic inform : %s" % ("every %ds" % iv if iv else "OFF - tasks only run when the router informs"))
+    print("Last inform     : %s (%s)" % (_utc(dev.get("_lastInform")), _ago(dev.get("_lastInform"))))
+    if nxt is not None:
+        print("Next due        : %s" % ("in %ds" % nxt if nxt > 0 else "now (overdue %ds)" % -nxt))
+    print("Last boot       : %s (%s)" % (_utc(dev.get("_lastBoot")), _ago(dev.get("_lastBoot"))))
+    print("Last bootstrap  : %s (%s)" % (_utc(dev.get("_lastBootstrap")), _ago(dev.get("_lastBootstrap"))))
+    print("Conn. request   : %s%s" % (url, "  (private address: the ACS can't reach it, so tasks wait "
+                                              "for the next inform)" if private else ""))
+
+
+def _task_desc(t):
+    if t.get("parameterValues"):
+        return ", ".join("%s=%s" % (p.partition(".")[2], "***" if re.search(r"(?i)key|pass", p) else v)
+                         for p, v, *_ in t["parameterValues"])
+    if t.get("parameterNames"):
+        return ", ".join(p.partition(".")[2] for p in t["parameterNames"])
+    return t.get("objectName", "") if "objectName" in t else ""
+
+
+def cmd_acs_tasks(base, args):
+    did = _acs_pick(base, args.id)
+    tasks, faults = _acs_find(base, "tasks", {"device": did}), _acs_find(base, "faults", {"device": did})
+    if args.clear:
+        if not tasks and not faults:
+            print("nothing queued"); return
+        if not args.yes and not _confirm("Cancel %d task(s) and clear %d fault(s)?" % (len(tasks), len(faults))):
+            print("aborted."); return
+        for t in tasks:
+            _acs_req(base, "DELETE", "/tasks/" + t["_id"])
+        for f in faults:
+            _acs_req(base, "DELETE", "/faults/" + _q(f["_id"]))
+        print("cancelled %d task(s), cleared %d fault(s)" % (len(tasks), len(faults)))
+        return
+    if not tasks and not faults:
+        print("no queued tasks or faults"); return
+    for t in tasks:
+        print("task  %s  %-18s %-10s %s" % (t["_id"], t.get("name"), _ago(t.get("timestamp")), _task_desc(t)[:80]))
+    for f in faults:
+        print("fault %s  %s  retries=%s  %s" % (f.get("channel"), _fault_text(f), f.get("retries"), _ago(f.get("timestamp"))))
+    nxt = _next_inform(_acs_device(base, did))
+    if tasks and nxt is not None:
+        print("\nqueued tasks run at the router's next inform (%s)" % ("in %ds" % nxt if nxt > 0 else "due now"))
 
 
 def cmd_acs(args):
     base = _acs_base(args)
     handlers = {"devices": cmd_acs_devices, "status": cmd_acs_status, "clients": cmd_acs_clients,
                 "wifi": cmd_acs_wifi, "wan": cmd_acs_wan, "firmware": cmd_acs_firmware,
-                "reboot": cmd_acs_reboot, "refresh": cmd_acs_refresh,
-                "get": cmd_acs_get, "set": cmd_acs_set, "params": cmd_acs_params}
+                "reboot": cmd_acs_reboot, "refresh": cmd_acs_refresh, "get": cmd_acs_get,
+                "set": cmd_acs_set, "params": cmd_acs_params, "inform": cmd_acs_inform,
+                "tasks": cmd_acs_tasks}
     try:
         handlers[args.acs_cmd](base, args)
     except requests.exceptions.RequestException as e:
-        sys.exit("cannot reach the ACS at %s (%s)\nRun this on the ACS host, or pass --acs-url / set $TPWRCTL_ACS." % (base, e))
+        why = ("can't connect" if isinstance(e, requests.exceptions.ConnectionError) else
+               "timed out" if isinstance(e, requests.exceptions.Timeout) else str(e)[:120])
+        sys.exit("cannot reach the ACS at %s (%s)\nRun this on the ACS host, or pass --acs-url / set $TPWRCTL_ACS." % (base, why))
     except RuntimeError as e:
         sys.exit("error: %s" % e)
+    except KeyboardInterrupt:
+        _progress("")
+        sys.exit("\nstopped waiting - anything queued still runs at the next inform ('acs tasks' to see/cancel)")
 
 
 # ----------------------------------------------------------------------------- telnet
@@ -1185,7 +1669,7 @@ def main():
     wf.set_defaults(fn=cmd_wifi)
     wf.add_argument("--ssid", help="set the network name (SSID)")
     # dest=psk so this does NOT clobber the global --password (admin login)
-    wf.add_argument("--password", dest="psk", help="set the WPA2 pre-shared key")
+    wf.add_argument("--password", dest="psk", type=_check_psk, help="set the WPA2 pre-shared key")
     wf.add_argument("--bandwidth", choices=["Auto", "20M", "40M"], help="set channel width")
     wf.add_argument("--radio", choices=["on", "off"], help="turn the Wi-Fi radio on/off")
     wf.add_argument("--dry-run", action="store_true", help="show what would change, send nothing")
@@ -1218,22 +1702,55 @@ def main():
     ubl.add_argument("mac", help="MAC address to unblock")
     ubl.add_argument("--dry-run", action="store_true", help="show what would be removed")
     sub.add_parser("blocklist", help="show Access Control state + blocked devices").set_defaults(fn=cmd_blocklist)
-    acs = sub.add_parser("acs", help="manage the router remotely via TR-069 (GenieACS ACS)")
+    acs = sub.add_parser("acs", help="manage the router remotely via TR-069 (GenieACS ACS)",
+                         description=ACS_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     acs.add_argument("--acs-url", help="GenieACS NBI base URL (default http://localhost:7557 / $TPWRCTL_ACS)")
-    asub = acs.add_subparsers(dest="acs_cmd", required=True)
-    asub.add_parser("devices", help="list devices (CPEs) known to the ACS")
-    ast_ = asub.add_parser("status", help="one-screen overview over TR-069"); ast_.add_argument("--id")
-    acl = asub.add_parser("clients", help="connected LAN hosts over TR-069"); acl.add_argument("--id"); acl.add_argument("--online", action="store_true")
-    awf = asub.add_parser("wifi", help="show Wi-Fi, or change it (--ssid/--password/--radio)"); awf.add_argument("--id")
-    awf.add_argument("--ssid"); awf.add_argument("--password", dest="psk"); awf.add_argument("--radio", choices=["on", "off"])
-    awf.add_argument("--dry-run", action="store_true"); awf.add_argument("-y", "--yes", action="store_true")
-    awn = asub.add_parser("wan", help="WAN/Internet details over TR-069"); awn.add_argument("--id")
-    asub.add_parser("firmware", help="firmware/model over TR-069").add_argument("--id")
-    ap_ = asub.add_parser("params", help="dump the device's TR-069 parameters"); ap_.add_argument("--id")
-    ag = asub.add_parser("get", help="read a TR-069 parameter"); ag.add_argument("param"); ag.add_argument("--id")
-    aset = asub.add_parser("set", help="set a TR-069 parameter"); aset.add_argument("param"); aset.add_argument("value"); aset.add_argument("--id")
-    arb = asub.add_parser("reboot", help="reboot the router via TR-069"); arb.add_argument("--id"); arb.add_argument("-y", "--yes", action="store_true")
-    arf = asub.add_parser("refresh", help="refresh the device's parameters"); arf.add_argument("--id"); arf.add_argument("--object", default="")
+    asub = acs.add_subparsers(dest="acs_cmd", required=True, metavar="COMMAND")
+    a_id = argparse.ArgumentParser(add_help=False)
+    a_id.add_argument("--id", help="device ID (default: the only device on the ACS)")
+    a_rd = argparse.ArgumentParser(add_help=False)
+    a_rd.add_argument("--refresh", action="store_true", help="re-read from the router first (waits for its next inform)")
+    a_wr = argparse.ArgumentParser(add_help=False)
+    a_wr.add_argument("--no-wait", action="store_true", help="only queue the task; don't wait for the router to run it")
+    a_y = argparse.ArgumentParser(add_help=False)
+    a_y.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    asub.add_parser("devices", help="list devices (CPEs) the ACS manages, and whether they still inform")
+    asub.add_parser("status", parents=[a_id, a_rd], help="one-screen overview (model, uptime, WAN, Wi-Fi, clients)")
+    acl = asub.add_parser("clients", parents=[a_id, a_rd], help="LAN hosts: name, IP, MAC, lease, online")
+    acl.add_argument("--online", action="store_true", help="only hosts that are online")
+    awf = asub.add_parser("wifi", parents=[a_id, a_rd, a_wr, a_y], help="show Wi-Fi (incl. password); flags change it")
+    awf.add_argument("--ssid", type=_check_ssid, help="set the network name")
+    awf.add_argument("--password", dest="psk", type=_check_psk,
+                     help="set the WPA2 key (remembered here: TR-069 never reads it back)")
+    awf.add_argument("--channel", type=_check_channel, help="'auto' or 1-13")
+    awf.add_argument("--bandwidth", choices=["Auto", "20M", "40M"], help="set channel width")
+    awf.add_argument("--radio", choices=["on", "off"], help="turn the radio on/off")
+    awf.add_argument("--dry-run", action="store_true", help="show what would change, send nothing")
+    asub.add_parser("wan", parents=[a_id, a_rd], help="WAN/Internet details")
+    asub.add_parser("firmware", parents=[a_id, a_rd], help="model, firmware, serial, uptime")
+    apm = asub.add_parser("params", parents=[a_id], help="list the cached TR-069 parameters")
+    apm.add_argument("prefix", nargs="?", help="only this subtree, e.g. DeviceInfo (root optional)")
+    apm.add_argument("--grep", metavar="REGEX", help="only paths matching REGEX (case-insensitive)")
+    apm.add_argument("-l", "--long", action="store_true", help="also show type, rw/ro and age")
+    ag = asub.add_parser("get", parents=[a_id, a_wr], help="read a parameter (or subtree) fresh from the router")
+    ag.add_argument("param", help="e.g. DeviceInfo.UpTime (root optional; a subtree reads all below it)")
+    ag.add_argument("--cached", action="store_true", help="print the ACS's cached value; don't ask the router")
+    ag.add_argument("--force", action="store_true", help="ask even if the ACS doesn't know the parameter")
+    aset = asub.add_parser("set", parents=[a_id, a_wr, a_y], help="write a parameter and read it back")
+    aset.add_argument("param", help="e.g. ManagementServer.PeriodicInformInterval (root optional)")
+    aset.add_argument("value")
+    aset.add_argument("--type", choices=["xsd:string", "xsd:boolean", "xsd:int", "xsd:unsignedInt",
+                                         "xsd:long", "xsd:unsignedLong", "xsd:dateTime"],
+                      help="TR-069 type (default: the parameter's known type)")
+    aset.add_argument("--force", action="store_true", help="send even if unknown or read-only")
+    aset.add_argument("--dry-run", action="store_true", help="show what would change, send nothing")
+    asub.add_parser("reboot", parents=[a_id, a_wr, a_y], help="reboot, and wait until the router is back")
+    arf = asub.add_parser("refresh", parents=[a_id, a_wr], help="re-read parameters from the router")
+    arf.add_argument("--object", default="", help="subtree to re-read, e.g. DeviceInfo (default: everything - slow)")
+    ain = asub.add_parser("inform", parents=[a_id, a_wr], help="inform schedule (when queued tasks run); --interval")
+    ain.add_argument("--interval", type=int, metavar="SEC", help="set the periodic inform interval (30-86400 s)")
+    atk = asub.add_parser("tasks", parents=[a_id, a_y], help="queued tasks and faults; --clear cancels them")
+    atk.add_argument("--clear", action="store_true", help="cancel every queued task and clear faults")
     tn = sub.add_parser(
         "telnet",
         help="run a command in the router's telnet CLI",

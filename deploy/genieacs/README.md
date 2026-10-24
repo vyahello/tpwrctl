@@ -42,18 +42,24 @@ The router sends a BOOTSTRAP inform within seconds; `tpwrctl acs devices` then l
 
 ## Manage it (run on the VM)
 ```bash
-tpwrctl acs devices                                   # what the ACS sees
-tpwrctl acs params                                     # dump the device's TR-069 tree
-tpwrctl acs get  InternetGatewayDevice.DeviceInfo.UpTime
-tpwrctl acs set  InternetGatewayDevice.ManagementServer.PeriodicInformInterval 120
-tpwrctl acs refresh                                   # repopulate parameters
-tpwrctl acs reboot                                    # reboot over TR-069
+tpwrctl acs devices                                   # what the ACS sees, and whether it still informs
+tpwrctl acs inform --interval 60                      # run queued tasks within a minute (default 300 s)
+tpwrctl acs status --refresh                          # fresh one-screen overview
+tpwrctl acs get  DeviceInfo.UpTime                    # read fresh from the router (root optional)
+tpwrctl acs set  ManagementServer.PeriodicInformInterval 120   # write + read back
+tpwrctl acs wifi --password 'new-key'                 # remembered in ~/.config/tpwrctl/acs-secrets.json
+tpwrctl acs reboot                                    # reboot, wait for the BOOT inform
+tpwrctl acs tasks                                     # queued tasks / faults (--clear cancels)
 ```
 
 ## Double-NAT note
 This router sits behind an upstream NAT, so the ACS **cannot** send it on-demand connection
-requests. Every task is therefore **queued and runs on the next periodic inform** (≤ the
-inform interval, default 300 s). Lower `PeriodicInformInterval` for snappier control.
+requests (its `ConnectionRequestURL` is a private address). Every task therefore runs at the
+router's **next periodic inform**; `tpwrctl acs` waits for it (with a countdown) and confirms the
+result, or `--no-wait` just queues. Lower `PeriodicInformInterval` (`acs inform --interval 60`) for
+snappier control. Instant control would need TR-111 (STUN + UDP connection requests): a STUN
+server here on UDP 3478, that port opened (ufw/iptables + the cloud security list) to the router's
+egress IP, and STUN enabled on the router — not set up.
 
 ## Web UI (optional)
 ```bash

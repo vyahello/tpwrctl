@@ -102,20 +102,34 @@ remotely — no LAN access needed. `tpwrctl acs …` drives the ACS's REST API.
 
 | Command | What it does |
 |---|---|
-| `acs devices` | List devices (CPEs) the ACS manages |
-| `acs status` | One-screen overview (model, firmware, uptime, WAN, Wi-Fi, clients) |
-| `acs clients [--online]` | Connected LAN hosts (name, IP, MAC) |
-| `acs wifi` | Show Wi-Fi (SSID, security, password, channel) |
-| `acs wifi --ssid/--password/--radio` | Change Wi-Fi (confirms; `--dry-run` to preview) |
-| `acs wan` | WAN/Internet details |
-| `acs firmware` | Firmware / model / uptime |
-| `acs reboot [-y]` | Reboot the router |
-| `acs refresh [--object O]` | Re-read the device's parameters |
-| `acs params` | Dump the full TR-069 parameter tree |
-| `acs get <param>` / `acs set <param> <value>` | Read / write any TR-069 parameter |
+| `acs devices` | Devices (CPEs) the ACS manages, last inform, still informing or silent |
+| `acs status [--refresh]` | One screen: model, firmware, uptime, WAN, Wi-Fi, clients — each with its age |
+| `acs clients [--online] [--refresh]` | LAN hosts: name, IP, MAC, lease left, online |
+| `acs wifi [--refresh]` | Wi-Fi: SSID, radio, channel, band, security, **password** |
+| `acs wifi --ssid/--password/--channel/--bandwidth/--radio` | Change Wi-Fi (confirms; `--dry-run` previews), then read it back |
+| `acs wan [--refresh]` / `acs firmware [--refresh]` | WAN details / model, firmware, serial, uptime |
+| `acs reboot [-y]` | Reboot **and wait until the router reports back** (~1 min) |
+| `acs get <param>` | Read a parameter — or a whole subtree, e.g. `DeviceInfo.` — fresh from the router (`--cached`: no round trip) |
+| `acs set <param> <value>` | Write with the right TR-069 type, then read it back (`--dry-run`; refuses unknown/read-only) |
+| `acs params [prefix] [--grep RE] [-l]` | List cached parameters (`-l`: type, rw/ro, age) |
+| `acs refresh [--object O]` | Re-read parameters (default: the whole tree) |
+| `acs inform [--interval N]` | When the router informs (= when queued tasks run); change the interval |
+| `acs tasks [--clear]` | Queued tasks and faults; `--clear` cancels them |
 
-Reads show the values from the last inform (shown with a timestamp); `acs refresh` pulls fresh
-ones. Writes queue and apply on the next inform (see the double-NAT note).
+Paths work with or without the root (`DeviceInfo.UpTime` = `InternetGatewayDevice.DeviceInfo.UpTime`).
+
+**How it behaves behind NAT.** The ACS can't reach the router on demand (its connection-request
+URL is a private address), so every task runs at the router's **next periodic inform**. Writes
+wait for that with a countdown, then confirm: `set`/`wifi`/`inform` read the value back in the
+same session, `reboot` waits for the BOOT inform, and a fault the router returns is shown and its
+task deleted (so GenieACS doesn't retry it forever). `--no-wait` only queues; Ctrl-C leaves the
+task queued (`acs tasks`). Reads show the ACS's cached values with their age; `--refresh` re-reads
+first. Use `acs inform --interval 60` so tasks run within a minute (default 300 s).
+
+**Passwords.** TR-069 never reads secrets back (the Wi-Fi key, like every password, reads empty).
+`acs wifi --password` therefore remembers the key it set in `~/.config/tpwrctl/acs-secrets.json`
+(mode 600) on the ACS host, and `acs wifi` shows it with when it was set. A key changed some other
+way (LAN `wifi --password`, the web UI) isn't seen by the ACS — set it once through `acs` again.
 
 **Blocking over TR-069 isn't supported on this router.** Access Control (wired+wireless) isn't in
 the data model, and the wireless MAC-filter table faults on writes (`SetParameterValues`→9003,
@@ -129,17 +143,16 @@ the data model, and the wireless MAC-filter table faults on writes (`SetParamete
 
 Working alternatives:
 `acs wifi --password <new>` (rotate the key — kicks all Wi-Fi clients), `acs wifi --radio off`
-(turn Wi-Fi off), or the LAN-side `block <MAC>` for targeted wired+wireless blocking. The Wi-Fi
-password is **write-only** over TR-069 (settable, not readable — read it on the LAN with `wifi`).
+(turn Wi-Fi off), or the LAN-side `block <MAC>` for targeted wired+wireless blocking.
 
 ```bash
 tpwrctl set MANAGEMENT_SERVER URL=http://<VM_IP>:7547/   # one-time: aim the router at the ACS
-tpwrctl acs devices
+tpwrctl acs inform --interval 60                         # tasks then run within a minute
+tpwrctl acs status --refresh
 tpwrctl acs reboot
 ```
 Setup and deployment: **[deploy/genieacs/README.md](deploy/genieacs/README.md)**. The NBI is
 localhost-only, so run `acs` commands on the ACS host (or set `--acs-url` / `$TPWRCTL_ACS`).
-Behind double-NAT, tasks queue and run on the next inform (≤ the inform interval).
 
 ## ✨ Looks like
 
