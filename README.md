@@ -72,10 +72,11 @@ tpwrctl wifi --radio off                                     # turn the radio of
 
 **Kick / block unknown devices** (Access Control blacklist — works for wired *and* wireless):
 ```bash
-tpwrctl devices --online            # find the unknown device's MAC
-tpwrctl block AA:BB:CC:DD:EE:FF      # block it (enables Access Control; asks to confirm)
-tpwrctl blocklist                    # see what's blocked
-tpwrctl unblock AA:BB:CC:DD:EE:FF    # let it back on
+tpwrctl devices --online                       # find the unknown device's MAC
+tpwrctl block AA:BB:CC:DD:EE:FF                 # labels it with the device hostname if known
+tpwrctl block AA:BB:CC:DD:EE:FF --name "Kitchen TV"   # or give it your own label
+tpwrctl blocklist                              # see what's blocked
+tpwrctl unblock AA:BB:CC:DD:EE:FF              # let it back on
 ```
 > Tip: if you don't know which clients are legit, rotating the Wi-Fi key (`tpwrctl wifi --password …`) boots everyone at once; blocking is the surgical option. Note that phones with MAC randomization can reappear under a new MAC.
 

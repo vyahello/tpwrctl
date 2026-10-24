@@ -474,14 +474,37 @@ def _ac_find(r, mac):
     return host, rule
 
 
+def _sanitize_name(s):
+    """Make a string valid for entryName: drop chars $.isname rejects, <=15 chars, no trailing space."""
+    return re.sub(r'[\\/":*?<>|&]', "-", s or "").strip()[:15].rstrip()
+
+
+def _block_name(r, mac, explicit, existing):
+    """Pick the block label: --name, else the device's hostname, else the MAC; kept unique & valid."""
+    mac_hex = mac.replace(":", "")
+    if explicit:
+        name = _sanitize_name(explicit)
+    else:
+        h = next((x for x in r.getlist("LAN_HOST_ENTRY")
+                  if _macnorm(x.get("MACAddress")) == mac), None)
+        hn = (h or {}).get("hostName", "")
+        name = _sanitize_name(hn) if hn and hn.lower() != "unknown" else ""
+    if not name:
+        name = mac_hex
+    if name in existing:                                  # entryName must be unique
+        sfx = "-" + mac_hex[-4:]
+        name = name[:15 - len(sfx)] + sfx
+    return name
+
+
 def cmd_block(r, args):
     mac = _macnorm(args.mac)
     if not _MAC_RE.match(mac):
         sys.exit("invalid MAC address: %s" % args.mac)
-    name = args.name or mac.replace(":", "")
     host, rule = _ac_find(r, mac)
     if host and rule:
         print("already blocked: %s (%s)" % (mac, host.get("entryName"))); return
+    name = _block_name(r, mac, args.name, {h.get("entryName") for h in r.getlist("INTERNAL_HOST")})
     fw = _fw_state(r)
     steps = []
     if fw.get("enable") != "1" or fw.get("firewallMode") != "1":
@@ -501,7 +524,7 @@ def cmd_block(r, args):
     r.cgi([{"action": ACT_ADD, "oid": "RULE",
             "attrs": {"isParentCtrl": "0", "ruleName": name, "internalHostRef": name,
                       "externalHostRef": "", "scheduleRef": "", "action": "0", "enable": "1"}}])
-    print("blocked %s" % mac)
+    print("blocked %s as '%s'" % (mac, name))
 
 
 def cmd_unblock(r, args):
@@ -878,7 +901,7 @@ def main():
     bl = sub.add_parser("block", help="block a device by MAC (Access Control blacklist)")
     bl.set_defaults(fn=cmd_block)
     bl.add_argument("mac", help="MAC address of the device to block")
-    bl.add_argument("--name", help="label for the entry (default: the MAC without colons)")
+    bl.add_argument("--name", help="label for the entry (default: the device's hostname, else its MAC)")
     bl.add_argument("--dry-run", action="store_true", help="show the plan, send nothing")
     bl.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     ubl = sub.add_parser("unblock", help="remove a device from the block list")
