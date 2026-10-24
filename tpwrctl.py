@@ -179,12 +179,19 @@ def devices(r):
     for h in hosts:
         mac = _macnorm(h.get("MACAddress"))
         a = assoc.get(mac)
+        active = h.get("active") == "1"
+        # The router only knows the link type while a host is online (X_TP_ConnType reads 0,
+        # i.e. "wired", for every offline host), so don't guess for offline ones.
+        if a or (active and h.get("X_TP_ConnType") == "1"):
+            conn = "Wi-Fi"
+        else:
+            conn = "Wired" if active else "-"
         out.append({
             "name": h.get("hostName", "Unknown"),
             "ip": h.get("IPAddress", ""),
             "mac": mac,
-            "conn": "Wi-Fi" if a else "Wired",
-            "active": h.get("active") == "1",
+            "conn": conn,
+            "active": active,
             "signal": (a or {}).get("X_TP_StaSignalStrength", ""),
             "linkrate": (a or {}).get("X_TP_StaConnectionSpeed", ""),
             "std": (a or {}).get("X_TP_StaStandard", ""),
@@ -298,14 +305,18 @@ def cmd_wifi(r, args):
     print("  Bandwidth  : %s" % ap.get("X_TP_Bandwidth", "?"))
     print("  Security   : %s" % _wifi_sec(ap))
     print("  Password   : %s" % (ap.get("X_TP_PreSharedKey", "") or "(none/open)"))
-    # Associated clients.
+    # Associated clients, named from the DHCP host table (same source as `devices`).
     a = r.getlist("LAN_WLAN_ASSOC_DEV")
+    hosts = {_macnorm(h.get("MACAddress")): h for h in r.getlist("LAN_HOST_ENTRY")}
     print("\nClients (%d):" % len(a))
     if a:
-        print("  %-17s %-7s %-8s %-4s %-6s %s" % ("MAC", "SIGNAL", "LINK", "STD", "BW", "TX/RX"))
+        print("  %-20s %-15s %-17s %-7s %-8s %-4s %-6s %s" % (
+            "NAME", "IP", "MAC", "SIGNAL", "LINK", "STD", "BW", "TX/RX"))
     for d in a:
-        print("  %-17s %-7s %-8s %-4s %-6s %s/%s" % (
-            _macnorm(d.get("associatedDeviceMACAddress")),
+        mac = _macnorm(d.get("associatedDeviceMACAddress"))
+        h = hosts.get(mac, {})
+        print("  %-20s %-15s %-17s %-7s %-8s %-4s %-6s %s/%s" % (
+            h.get("hostName", "Unknown")[:20], h.get("IPAddress", "-"), mac,
             d.get("X_TP_StaSignalStrength", "") + "dBm",
             d.get("X_TP_StaConnectionSpeed", "") + "M",
             d.get("X_TP_StaStandard", ""), d.get("X_TP_StaBandWidth", "").strip(),
